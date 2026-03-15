@@ -1,5 +1,6 @@
 //! SMT solver: processes SMT-LIB commands by translating assertions
-//! into SAT via bit-blasting (for bitvectors) or direct encoding (for booleans).
+//! into SAT via bit-blasting (for bitvectors) or direct encoding (for booleans),
+//! and using theory solvers for Int, Real, and String.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -9,12 +10,14 @@ use crate::bitvector::{BitBlaster, BitVec};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::sat::{Lit, SatResult, SatSolver};
+use crate::theories::{SatStatus, TheorySolver, TheoryValue};
 
 /// A typed value in the solver
 #[derive(Debug, Clone)]
 enum Value {
     Bool(Lit),
     BitVector(BitVec),
+    Theory, // managed by TheorySolver
 }
 
 /// Stack frame for push/pop
@@ -25,24 +28,28 @@ struct Frame {
 
 pub struct SmtSolver {
     sat: SatSolver,
+    theory: TheorySolver,
     variables: HashMap<String, Value>,
     var_sorts: HashMap<String, Sort>,
     defined_funs: HashMap<String, (Vec<(String, Sort)>, Term)>,
     stack: Vec<Frame>,
     logic: Option<String>,
     produce_models: bool,
+    theory_assertions: Vec<Term>,
 }
 
 impl SmtSolver {
     pub fn new() -> Self {
         SmtSolver {
             sat: SatSolver::new(),
+            theory: TheorySolver::new(),
             variables: HashMap::new(),
             var_sorts: HashMap::new(),
             defined_funs: HashMap::new(),
             stack: Vec::new(),
             logic: None,
             produce_models: false,
+            theory_assertions: Vec::new(),
         }
     }
 
@@ -59,7 +66,6 @@ impl SmtSolver {
                     input.push_str(&l);
                     input.push('\n');
 
-                    // Try to parse when we have balanced parens
                     if Self::parens_balanced(&input) {
                         match self.process_input(&input) {
                             Ok(responses) => {
@@ -122,18 +128,49 @@ impl SmtSolver {
         Ok(responses)
     }
 
+    /// Determine if a term involves theory sorts (Int/Real/String)
+    fn is_theory_term(&self, term: &Term) -> bool {
+        match self.infer_sort(term) {
+            Some(Sort::Int) | Some(Sort::Real) | Some(Sort::String) => true,
+            _ => self.term_uses_theory(term),
+        }
+    }
+
+    fn term_uses_theory(&self, term: &Term) -> bool {
+        match term {
+            Term::IntLiteral(_) | Term::RealLiteral(_, _) | Term::StringLiteral(_) => true,
+            Term::Neg(_) | Term::Add(_) | Term::Sub(_, _) | Term::Mul(_) | Term::Div(_, _)
+            | Term::Mod(_, _) | Term::Abs(_) | Term::Lt(_, _) | Term::Le(_, _)
+            | Term::Gt(_, _) | Term::Ge(_, _) | Term::ToReal(_) | Term::ToInt(_)
+            | Term::IsInt(_) | Term::Divisible(_, _) => true,
+            Term::StrLen(_) | Term::StrConcat(_) | Term::StrAt(_, _) | Term::StrSubstr(_, _, _)
+            | Term::StrContains(_, _) | Term::StrIndexOf(_, _, _) | Term::StrReplace(_, _, _)
+            | Term::StrPrefixOf(_, _) | Term::StrSuffixOf(_, _) | Term::StrToInt(_)
+            | Term::IntToStr(_) | Term::StrLt(_, _) | Term::StrLe(_, _) => true,
+            Term::Variable(name) => {
+                matches!(
+                    self.var_sorts.get(name),
+                    Some(Sort::Int) | Some(Sort::Real) | Some(Sort::String)
+                )
+            }
+            Term::Not(t) => self.term_uses_theory(t),
+            Term::And(ts) | Term::Or(ts) => ts.iter().any(|t| self.term_uses_theory(t)),
+            Term::Xor(a, b) | Term::Implies(a, b) | Term::Eq(a, b) | Term::Distinct(a, b) => {
+                self.term_uses_theory(a) || self.term_uses_theory(b)
+            }
+            Term::Ite(c, t, e) => {
+                self.term_uses_theory(c) || self.term_uses_theory(t) || self.term_uses_theory(e)
+            }
+            Term::Let { bindings, body } => {
+                bindings.iter().any(|(_, v)| self.term_uses_theory(v)) || self.term_uses_theory(body)
+            }
+            _ => false,
+        }
+    }
+
     fn execute_command(&mut self, cmd: Command) -> Result<Option<String>, String> {
         match cmd {
             Command::SetLogic(logic) => {
-                match logic.as_str() {
-                    "QF_BV" | "QF_UF" | "QF_UFBV" | "QF_LIA" | "ALL" | "HORN" => {}
-                    other => {
-                        // Accept but warn about unsupported logics
-                        if !other.contains("BV") && other != "QF_UF" && other != "ALL" {
-                            // Still accept it
-                        }
-                    }
-                }
                 self.logic = Some(logic);
                 Ok(None)
             }
@@ -156,26 +193,58 @@ impl SmtSolver {
                 Ok(None)
             }
             Command::DefineFun(name, params, _sort, body) => {
-                self.defined_funs.insert(name, (params, body));
+                self.defined_funs.insert(name.clone(), (params.clone(), body.clone()));
+                self.theory.define_fun(name, params, body);
                 Ok(None)
             }
             Command::Assert(term) => {
-                let lit = self.encode_bool_term(&term)?;
-                self.sat.add_clause(vec![lit]);
+                if self.is_theory_term(&term) {
+                    self.theory_assertions.push(term.clone());
+                    self.theory.add_constraint(term, true);
+                } else {
+                    let lit = self.encode_bool_term(&term)?;
+                    self.sat.add_clause(vec![lit]);
+                }
                 Ok(None)
             }
             Command::CheckSat => {
-                let result = self.sat.solve();
-                Ok(Some(match result {
-                    SatResult::Sat => "sat".to_string(),
-                    SatResult::Unsat => "unsat".to_string(),
-                    SatResult::Unknown => "unknown".to_string(),
-                }))
+                let has_theory = !self.theory_assertions.is_empty()
+                    || self.var_sorts.values().any(|s| {
+                        matches!(s, Sort::Int | Sort::Real | Sort::String)
+                    });
+
+                if has_theory {
+                    // Check theory constraints
+                    let sat_result = self.sat.solve();
+                    let theory_result = self.theory.check_sat();
+
+                    match (sat_result, theory_result) {
+                        (SatResult::Sat, SatStatus::Sat) | (SatResult::Sat, _)
+                            if self.theory_assertions.is_empty() =>
+                        {
+                            Ok(Some("sat".into()))
+                        }
+                        (_, SatStatus::Sat) if !has_bool_bv_vars(&self.var_sorts) => {
+                            Ok(Some("sat".into()))
+                        }
+                        (SatResult::Sat, SatStatus::Sat) => Ok(Some("sat".into())),
+                        (SatResult::Unsat, _) => Ok(Some("unsat".into())),
+                        (_, SatStatus::Unsat) => Ok(Some("unsat".into())),
+                        _ => Ok(Some("unknown".into())),
+                    }
+                } else {
+                    let result = self.sat.solve();
+                    Ok(Some(match result {
+                        SatResult::Sat => "sat".to_string(),
+                        SatResult::Unsat => "unsat".to_string(),
+                        SatResult::Unknown => "unknown".to_string(),
+                    }))
+                }
             }
             Command::GetModel => {
                 let mut model = String::from("(\n");
                 let mut sorted_vars: Vec<_> = self.var_sorts.iter().collect();
-                sorted_vars.sort_by_key(|(name, _)| name.clone());
+                sorted_vars.sort_by_key(|(name, _)| (*name).clone());
                 for (name, sort) in &sorted_vars {
                     match sort {
                         Sort::Bool => {
@@ -186,7 +255,7 @@ impl SmtSolver {
                                         let actual = if *lit > 0 { b } else { !b };
                                         if actual { "true" } else { "false" }
                                     }
-                                    None => "true", // default
+                                    None => "true",
                                 };
                                 model.push_str(&format!(
                                     "  (define-fun {} () Bool {})\n",
@@ -200,6 +269,30 @@ impl SmtSolver {
                                 model.push_str(&format!(
                                     "  (define-fun {} () (_ BitVec {}) (_ bv{} {}))\n",
                                     name, w, val, w
+                                ));
+                            }
+                        }
+                        Sort::Int => {
+                            if let Some(val_str) = self.theory.get_model_value(name, sort) {
+                                model.push_str(&format!(
+                                    "  (define-fun {} () Int {})\n",
+                                    name, val_str
+                                ));
+                            }
+                        }
+                        Sort::Real => {
+                            if let Some(val_str) = self.theory.get_model_value(name, sort) {
+                                model.push_str(&format!(
+                                    "  (define-fun {} () Real {})\n",
+                                    name, val_str
+                                ));
+                            }
+                        }
+                        Sort::String => {
+                            if let Some(val_str) = self.theory.get_model_value(name, sort) {
+                                model.push_str(&format!(
+                                    "  (define-fun {} () String {})\n",
+                                    name, val_str
                                 ));
                             }
                         }
@@ -234,22 +327,14 @@ impl SmtSolver {
                     if let Some(frame) = self.stack.pop() {
                         for (name, old_val) in frame.var_snapshot.into_iter().rev() {
                             match old_val {
-                                Some(v) => {
-                                    self.variables.insert(name, v);
-                                }
-                                None => {
-                                    self.variables.remove(&name);
-                                }
+                                Some(v) => { self.variables.insert(name, v); }
+                                None => { self.variables.remove(&name); }
                             }
                         }
                         for (name, old_def) in frame.defined_snapshot.into_iter().rev() {
                             match old_def {
-                                Some(d) => {
-                                    self.defined_funs.insert(name, d);
-                                }
-                                None => {
-                                    self.defined_funs.remove(&name);
-                                }
+                                Some(d) => { self.defined_funs.insert(name, d); }
+                                None => { self.defined_funs.remove(&name); }
                             }
                         }
                     }
@@ -262,9 +347,11 @@ impl SmtSolver {
             }
             Command::ResetAssertions => {
                 self.sat = SatSolver::new();
+                self.theory.reset();
                 self.variables.clear();
                 self.var_sorts.clear();
                 self.stack.clear();
+                self.theory_assertions.clear();
                 Ok(None)
             }
             Command::Exit => Ok(None),
@@ -281,6 +368,10 @@ impl SmtSolver {
             Sort::BitVec(w) => {
                 let bv = BitVec::new_variable(&mut self.sat, *w);
                 Value::BitVector(bv)
+            }
+            Sort::Int | Sort::Real | Sort::String => {
+                self.theory.declare_variable(name, sort);
+                Value::Theory
             }
         };
         self.variables.insert(name.to_string(), value);
@@ -303,7 +394,6 @@ impl SmtSolver {
                 Ok(lit)
             }
             Term::Variable(name) => {
-                // Check if it's a defined function with no args
                 if let Some((params, body)) = self.defined_funs.get(name).cloned() {
                     if params.is_empty() {
                         return self.encode_bool_term(&body);
@@ -313,6 +403,9 @@ impl SmtSolver {
                     Some(Value::Bool(lit)) => Ok(*lit),
                     Some(Value::BitVector(_)) => {
                         Err(format!("expected Bool, got BitVec for '{}'", name))
+                    }
+                    Some(Value::Theory) => {
+                        Err(format!("cannot encode theory variable '{}' as SAT literal", name))
                     }
                     None => Err(format!("undeclared variable: '{}'", name)),
                 }
@@ -335,13 +428,10 @@ impl SmtSolver {
                 if lits.len() == 1 {
                     return Ok(lits[0]);
                 }
-                // Tseitin: r <=> (l1 AND l2 AND ...)
                 let r = self.sat.new_var() as Lit;
-                // r => li: for each li, (-r OR li)
                 for &l in &lits {
                     self.sat.add_clause(vec![-r, l]);
                 }
-                // l1 AND l2 AND ... => r
                 let mut clause: Vec<Lit> = lits.iter().map(|&l| -l).collect();
                 clause.push(r);
                 self.sat.add_clause(clause);
@@ -362,11 +452,9 @@ impl SmtSolver {
                     return Ok(lits[0]);
                 }
                 let r = self.sat.new_var() as Lit;
-                // r => (l1 OR l2 OR ...): (-r OR l1 OR l2 OR ...)
                 let mut clause = vec![-r];
                 clause.extend_from_slice(&lits);
                 self.sat.add_clause(clause);
-                // li => r: for each li, (-li OR r)
                 for &l in &lits {
                     self.sat.add_clause(vec![-l, r]);
                 }
@@ -386,47 +474,36 @@ impl SmtSolver {
                 let la = self.encode_bool_term(a)?;
                 let lb = self.encode_bool_term(b)?;
                 let r = self.sat.new_var() as Lit;
-                // r <=> (!a OR b)
-                // r => (!a OR b): (-r OR -a OR b)
                 self.sat.add_clause(vec![-r, -la, lb]);
-                // (!a OR b) => r: (a OR r) AND (-b OR r)
                 self.sat.add_clause(vec![la, r]);
                 self.sat.add_clause(vec![-lb, r]);
                 Ok(r)
             }
             Term::Ite(cond, then_t, else_t) => {
-                let cond_sort = self.infer_sort(cond);
                 let then_sort = self.infer_sort(then_t);
-
-                if then_sort == Some(Sort::Bool) || cond_sort == Some(Sort::Bool) {
-                    // Check if then/else are booleans
+                if then_sort == Some(Sort::Bool) || self.infer_sort(cond) == Some(Sort::Bool) {
                     if let (Ok(lt), Ok(le)) = (
                         self.encode_bool_term(then_t),
                         self.encode_bool_term(else_t),
                     ) {
                         let lc = self.encode_bool_term(cond)?;
                         let r = self.sat.new_var() as Lit;
-                        // cond => (r <=> then)
                         self.sat.add_clause(vec![-lc, -r, lt]);
                         self.sat.add_clause(vec![-lc, r, -lt]);
-                        // !cond => (r <=> else)
                         self.sat.add_clause(vec![lc, -r, le]);
                         self.sat.add_clause(vec![lc, r, -le]);
                         return Ok(r);
                     }
                 }
-
-                Err("ite with bitvector result used in boolean context".into())
+                Err("ite with non-boolean result used in boolean context".into())
             }
             Term::Eq(a, b) => {
-                // Could be Bool = Bool or BV = BV
                 let sort_a = self.infer_sort(a);
                 let sort_b = self.infer_sort(b);
                 match (&sort_a, &sort_b) {
                     (Some(Sort::Bool), _) | (_, Some(Sort::Bool)) => {
                         let la = self.encode_bool_term(a)?;
                         let lb = self.encode_bool_term(b)?;
-                        // r <=> (a XNOR b)
                         let r = self.sat.new_var() as Lit;
                         self.sat.add_clause(vec![-r, -la, lb]);
                         self.sat.add_clause(vec![-r, la, -lb]);
@@ -434,8 +511,12 @@ impl SmtSolver {
                         self.sat.add_clause(vec![r, la, lb]);
                         Ok(r)
                     }
+                    (Some(Sort::Int), _) | (_, Some(Sort::Int))
+                    | (Some(Sort::Real), _) | (_, Some(Sort::Real))
+                    | (Some(Sort::String), _) | (_, Some(Sort::String)) => {
+                        Err("theory equality should be handled by theory solver".into())
+                    }
                     _ => {
-                        // Try bitvector
                         let bva = self.encode_bv_term(a)?;
                         let bvb = self.encode_bv_term(b)?;
                         let mut bb = BitBlaster::new(&mut self.sat);
@@ -506,60 +587,48 @@ impl SmtSolver {
             }
 
             Term::Let { bindings, body } => {
-                // Save old bindings
                 let mut saved = Vec::new();
                 for (name, val_term) in bindings {
                     let old = self.variables.get(name).cloned();
                     saved.push((name.clone(), old));
 
-                    // Determine sort of the binding
                     let sort = self.infer_sort(val_term);
                     match sort {
                         Some(Sort::Bool) | None => {
-                            // Try bool first
                             match self.encode_bool_term(val_term) {
                                 Ok(lit) => {
-                                    self.variables
-                                        .insert(name.clone(), Value::Bool(lit));
-                                    self.var_sorts
-                                        .insert(name.clone(), Sort::Bool);
+                                    self.variables.insert(name.clone(), Value::Bool(lit));
+                                    self.var_sorts.insert(name.clone(), Sort::Bool);
                                 }
                                 Err(_) => {
-                                    // Try BV
                                     let bv = self.encode_bv_term(val_term)?;
                                     let w = bv.width();
-                                    self.variables
-                                        .insert(name.clone(), Value::BitVector(bv));
-                                    self.var_sorts
-                                        .insert(name.clone(), Sort::BitVec(w));
+                                    self.variables.insert(name.clone(), Value::BitVector(bv));
+                                    self.var_sorts.insert(name.clone(), Sort::BitVec(w));
                                 }
                             }
                         }
                         Some(Sort::BitVec(_)) => {
                             let bv = self.encode_bv_term(val_term)?;
                             let w = bv.width();
-                            self.variables
-                                .insert(name.clone(), Value::BitVector(bv));
-                            self.var_sorts
-                                .insert(name.clone(), Sort::BitVec(w));
+                            self.variables.insert(name.clone(), Value::BitVector(bv));
+                            self.var_sorts.insert(name.clone(), Sort::BitVec(w));
+                        }
+                        Some(Sort::Int) | Some(Sort::Real) | Some(Sort::String) => {
+                            self.variables.insert(name.clone(), Value::Theory);
+                            self.var_sorts.insert(name.clone(), sort.unwrap());
                         }
                     }
                 }
 
                 let result = self.encode_bool_term(body);
 
-                // Restore bindings
                 for (name, old) in saved.into_iter().rev() {
                     match old {
-                        Some(v) => {
-                            self.variables.insert(name, v);
-                        }
-                        None => {
-                            self.variables.remove(&name);
-                        }
+                        Some(v) => { self.variables.insert(name, v); }
+                        None => { self.variables.remove(&name); }
                     }
                 }
-
                 result
             }
 
@@ -586,6 +655,9 @@ impl SmtSolver {
                     Some(Value::BitVector(bv)) => Ok(bv.clone()),
                     Some(Value::Bool(_)) => {
                         Err(format!("expected BitVec, got Bool for '{}'", name))
+                    }
+                    Some(Value::Theory) => {
+                        Err(format!("expected BitVec, got theory sort for '{}'", name))
                     }
                     None => Err(format!("undeclared variable: '{}'", name)),
                 }
@@ -708,10 +780,8 @@ impl SmtSolver {
                 let mut bits = Vec::with_capacity(w);
                 for i in 0..w {
                     let r = self.sat.new_var() as Lit;
-                    // cond => (r <=> then[i])
                     self.sat.add_clause(vec![-cond_lit, -r, then_bv.bits[i]]);
                     self.sat.add_clause(vec![-cond_lit, r, -then_bv.bits[i]]);
-                    // !cond => (r <=> else[i])
                     self.sat.add_clause(vec![cond_lit, -r, else_bv.bits[i]]);
                     self.sat.add_clause(vec![cond_lit, r, -else_bv.bits[i]]);
                     bits.push(r);
@@ -775,6 +845,9 @@ impl SmtSolver {
                     None
                 }
             }
+            Term::IntLiteral(_) => Some(Sort::Int),
+            Term::RealLiteral(_, _) => Some(Sort::Real),
+            Term::StringLiteral(_) => Some(Sort::String),
             Term::Variable(name) => self.var_sorts.get(name).cloned(),
             Term::Not(_) | Term::And(_) | Term::Or(_) | Term::Xor(_, _)
             | Term::Implies(_, _) => Some(Sort::Bool),
@@ -783,6 +856,10 @@ impl SmtSolver {
             | Term::BvSlt(_, _) | Term::BvSle(_, _) | Term::BvSgt(_, _) | Term::BvSge(_, _) => {
                 Some(Sort::Bool)
             }
+            Term::Lt(_, _) | Term::Le(_, _) | Term::Gt(_, _) | Term::Ge(_, _) => Some(Sort::Bool),
+            Term::IsInt(_) | Term::Divisible(_, _) => Some(Sort::Bool),
+            Term::StrContains(_, _) | Term::StrPrefixOf(_, _) | Term::StrSuffixOf(_, _)
+            | Term::StrLt(_, _) | Term::StrLe(_, _) => Some(Sort::Bool),
             Term::BvNot(t) | Term::BvNeg(t) => self.infer_sort(t),
             Term::BvAnd(a, _) | Term::BvOr(a, _) | Term::BvXor(a, _)
             | Term::BvAdd(a, _) | Term::BvSub(a, _) | Term::BvMul(a, _)
@@ -804,6 +881,21 @@ impl SmtSolver {
                     other => other,
                 })
             }
+            Term::Neg(t) | Term::Abs(t) => self.infer_sort(t),
+            Term::Add(ts) | Term::Mul(ts) => {
+                for t in ts {
+                    if let Some(s) = self.infer_sort(t) {
+                        return Some(s);
+                    }
+                }
+                None
+            }
+            Term::Sub(a, _) | Term::Div(a, _) | Term::Mod(a, _) => self.infer_sort(a),
+            Term::ToReal(_) => Some(Sort::Real),
+            Term::ToInt(_) => Some(Sort::Int),
+            Term::StrLen(_) | Term::StrToInt(_) | Term::StrIndexOf(_, _, _) => Some(Sort::Int),
+            Term::StrConcat(_) | Term::StrAt(_, _) | Term::StrSubstr(_, _, _)
+            | Term::StrReplace(_, _, _) | Term::IntToStr(_) => Some(Sort::String),
             Term::Ite(_, t, _) => self.infer_sort(t),
             Term::Let { body, .. } => self.infer_sort(body),
         }
@@ -827,11 +919,28 @@ impl SmtSolver {
                     let w = bv.width();
                     Ok(format!("(_ bv{} {})", val, w))
                 }
+                Some(Value::Theory) => {
+                    let sort = self.var_sorts.get(name).ok_or("unknown sort")?;
+                    self.theory
+                        .get_model_value(name, sort)
+                        .ok_or_else(|| format!("no value for theory variable: {}", name))
+                }
                 None => Err(format!("unknown variable: {}", name)),
             },
-            _ => Err("get-value only supports variables".into()),
+            _ => {
+                // Try theory evaluation
+                if let Some(val) = self.theory.eval_value(term) {
+                    Ok(val.to_string())
+                } else {
+                    Err("get-value only supports variables and theory terms".into())
+                }
+            }
         }
     }
+}
+
+fn has_bool_bv_vars(var_sorts: &HashMap<String, Sort>) -> bool {
+    var_sorts.values().any(|s| matches!(s, Sort::Bool | Sort::BitVec(_)))
 }
 
 #[cfg(test)]
@@ -842,6 +951,8 @@ mod tests {
         let mut solver = SmtSolver::new();
         solver.process_input(input).unwrap()
     }
+
+    // === Existing Bool tests ===
 
     #[test]
     fn test_bool_sat() {
@@ -864,6 +975,8 @@ mod tests {
         );
         assert_eq!(result, vec!["unsat"]);
     }
+
+    // === Existing BV tests ===
 
     #[test]
     fn test_bv_sat() {
@@ -975,7 +1088,7 @@ mod tests {
         );
         assert_eq!(result[0], "sat");
         assert!(result[1].contains("define-fun x"));
-        assert!(result[1].contains("bv66 8")); // 0x42 = 66
+        assert!(result[1].contains("bv66 8"));
     }
 
     #[test]
@@ -1022,7 +1135,7 @@ mod tests {
              (assert (= (bvmul x y) #x15))
              (check-sat)",
         );
-        assert_eq!(result, vec!["sat"]); // 3 * 7 = 21 = 0x15
+        assert_eq!(result, vec!["sat"]);
     }
 
     #[test]
@@ -1056,6 +1169,298 @@ mod tests {
              (assert (= x #xF))
              (assert (= ((_ zero_extend 4) x) #x0F))
              (check-sat)",
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    // === New Int tests ===
+
+    #[test]
+    fn test_int_sat() {
+        let result = check(
+            "(set-logic QF_LIA)
+             (declare-const x Int)
+             (assert (= x 5))
+             (check-sat)",
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_int_unsat() {
+        let result = check(
+            "(set-logic QF_LIA)
+             (declare-const x Int)
+             (assert (= x 5))
+             (assert (= x 3))
+             (check-sat)",
+        );
+        assert_eq!(result, vec!["unsat"]);
+    }
+
+    #[test]
+    fn test_int_arithmetic() {
+        let result = check(
+            "(set-logic QF_LIA)
+             (declare-const x Int)
+             (assert (= (+ x 3) 10))
+             (check-sat)
+             (get-model)",
+        );
+        assert_eq!(result[0], "sat");
+        assert!(result[1].contains("define-fun x () Int 7"));
+    }
+
+    #[test]
+    fn test_int_comparison() {
+        let result = check(
+            "(set-logic QF_LIA)
+             (declare-const x Int)
+             (assert (> x 0))
+             (assert (< x 3))
+             (check-sat)",
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_int_mul() {
+        let result = check(
+            "(set-logic QF_NIA)
+             (declare-const x Int)
+             (assert (= (* x 3) 21))
+             (check-sat)
+             (get-model)",
+        );
+        assert_eq!(result[0], "sat");
+        assert!(result[1].contains("define-fun x () Int 7"));
+    }
+
+    #[test]
+    fn test_int_mod() {
+        let result = check(
+            "(set-logic QF_LIA)
+             (declare-const x Int)
+             (assert (= x 7))
+             (assert (= (mod x 3) 1))
+             (check-sat)",
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_int_abs() {
+        let result = check(
+            "(set-logic QF_LIA)
+             (declare-const x Int)
+             (assert (= x (- 5)))
+             (assert (= (abs x) 5))
+             (check-sat)",
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_int_distinct() {
+        let result = check(
+            "(set-logic QF_LIA)
+             (declare-const x Int)
+             (declare-const y Int)
+             (assert (distinct x y))
+             (assert (= x 5))
+             (assert (= y 5))
+             (check-sat)",
+        );
+        assert_eq!(result, vec!["unsat"]);
+    }
+
+    // === New Real tests ===
+
+    #[test]
+    fn test_real_sat() {
+        let result = check(
+            "(set-logic QF_LRA)
+             (declare-const x Real)
+             (assert (= x 3.0))
+             (check-sat)",
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_real_arithmetic() {
+        let result = check(
+            "(set-logic QF_LRA)
+             (declare-const x Real)
+             (assert (= (+ x 1.0) 4.0))
+             (check-sat)",
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_real_comparison() {
+        let result = check(
+            "(set-logic QF_LRA)
+             (declare-const x Real)
+             (assert (> x 0.0))
+             (assert (< x 2.0))
+             (check-sat)",
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    // === New String tests ===
+
+    #[test]
+    fn test_string_sat() {
+        let result = check(
+            r#"(set-logic QF_S)
+             (declare-const s String)
+             (assert (= s "hello"))
+             (check-sat)"#,
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_string_unsat() {
+        let result = check(
+            r#"(set-logic QF_S)
+             (declare-const s String)
+             (assert (= s "hello"))
+             (assert (= s "world"))
+             (check-sat)"#,
+        );
+        assert_eq!(result, vec!["unsat"]);
+    }
+
+    #[test]
+    fn test_string_len() {
+        let result = check(
+            r#"(set-logic QF_S)
+             (declare-const s String)
+             (assert (= s "hello"))
+             (assert (= (str.len s) 5))
+             (check-sat)"#,
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_string_concat() {
+        let result = check(
+            r#"(set-logic QF_S)
+             (declare-const s String)
+             (assert (= s "hello"))
+             (assert (= (str.++ s " world") "hello world"))
+             (check-sat)"#,
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_string_contains() {
+        let result = check(
+            r#"(set-logic QF_S)
+             (declare-const s String)
+             (assert (= s "hello world"))
+             (assert (str.contains s "world"))
+             (check-sat)"#,
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_string_contains_unsat() {
+        let result = check(
+            r#"(set-logic QF_S)
+             (declare-const s String)
+             (assert (= s "hello"))
+             (assert (str.contains s "world"))
+             (check-sat)"#,
+        );
+        assert_eq!(result, vec!["unsat"]);
+    }
+
+    #[test]
+    fn test_string_prefix() {
+        let result = check(
+            r#"(set-logic QF_S)
+             (declare-const s String)
+             (assert (= s "hello world"))
+             (assert (str.prefixof "hello" s))
+             (check-sat)"#,
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_string_model() {
+        let result = check(
+            r#"(set-logic QF_S)
+             (declare-const s String)
+             (assert (= s "test"))
+             (check-sat)
+             (get-model)"#,
+        );
+        assert_eq!(result[0], "sat");
+        assert!(result[1].contains("define-fun s () String \"test\""));
+    }
+
+    #[test]
+    fn test_int_model() {
+        let result = check(
+            "(set-logic QF_LIA)
+             (declare-const x Int)
+             (assert (= x 42))
+             (check-sat)
+             (get-model)",
+        );
+        assert_eq!(result[0], "sat");
+        assert!(result[1].contains("define-fun x () Int 42"));
+    }
+
+    #[test]
+    fn test_string_substr() {
+        let result = check(
+            r#"(set-logic QF_S)
+             (declare-const s String)
+             (assert (= s "hello"))
+             (assert (= (str.substr s 1 3) "ell"))
+             (check-sat)"#,
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_str_to_int() {
+        let result = check(
+            r#"(set-logic QF_S)
+             (assert (= (str.to_int "42") 42))
+             (check-sat)"#,
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_int_to_str() {
+        let result = check(
+            r#"(set-logic QF_S)
+             (assert (= (str.from_int 42) "42"))
+             (check-sat)"#,
+        );
+        assert_eq!(result, vec!["sat"]);
+    }
+
+    #[test]
+    fn test_string_replace() {
+        let result = check(
+            r#"(set-logic QF_S)
+             (declare-const s String)
+             (assert (= s "hello world"))
+             (assert (= (str.replace s "world" "rust") "hello rust"))
+             (check-sat)"#,
         );
         assert_eq!(result, vec!["sat"]);
     }

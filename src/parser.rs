@@ -2,6 +2,10 @@ use crate::ast::{Command, Sort, Term};
 use crate::lexer::Token;
 use std::fmt;
 
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 #[derive(Debug)]
 pub struct ParseError {
     pub message: String,
@@ -204,6 +208,18 @@ impl Parser {
                 self.advance()?;
                 Ok(Sort::Bool)
             }
+            Some(Token::Symbol(ref s)) if s == "Int" => {
+                self.advance()?;
+                Ok(Sort::Int)
+            }
+            Some(Token::Symbol(ref s)) if s == "Real" => {
+                self.advance()?;
+                Ok(Sort::Real)
+            }
+            Some(Token::Symbol(ref s)) if s == "String" => {
+                self.advance()?;
+                Ok(Sort::String)
+            }
             Some(Token::LParen) => {
                 self.advance()?; // (
                 let underscore = self.expect_symbol()?;
@@ -242,12 +258,29 @@ impl Parser {
             Some(Token::Numeral(ref n)) => {
                 let n = n.clone();
                 self.advance()?;
-                // Bare numerals in Bool context are not standard, but we keep them
-                // They'll be resolved during type checking
-                Ok(Term::BitVecLiteral {
-                    value: n.parse::<u64>().map_err(|_| ParseError::new("invalid numeral"))?,
-                    width: 0, // width unknown, to be resolved
-                })
+                // Bare numerals are Int literals in SMT-LIB
+                Ok(Term::IntLiteral(
+                    n.parse::<i64>().map_err(|_| ParseError::new("invalid numeral"))?,
+                ))
+            }
+            Some(Token::Decimal(ref d)) => {
+                let d = d.clone();
+                self.advance()?;
+                // Parse decimal as rational: "3.14" => 314/100
+                let parts: Vec<&str> = d.split('.').collect();
+                let int_part: i64 = parts[0].parse().unwrap_or(0);
+                let frac_str = if parts.len() > 1 { parts[1] } else { "0" };
+                let denom = 10i64.pow(frac_str.len() as u32);
+                let frac_part: i64 = frac_str.parse().unwrap_or(0);
+                let numer = int_part * denom + frac_part;
+                // Simplify
+                let g = gcd(numer.unsigned_abs(), denom.unsigned_abs()) as i64;
+                Ok(Term::RealLiteral(numer / g, denom / g))
+            }
+            Some(Token::StringLiteral(ref s)) => {
+                let s = s.clone();
+                self.advance()?;
+                Ok(Term::StringLiteral(s))
             }
             Some(Token::HexLiteral(ref h)) => {
                 let h = h.clone();
@@ -527,6 +560,167 @@ impl Parser {
                 Ok(Term::Concat(Box::new(a), Box::new(b)))
             }
 
+            // Int/Real arithmetic
+            "+" => {
+                let args = self.parse_term_list()?;
+                Ok(Term::Add(args))
+            }
+            "-" => {
+                let a = self.parse_term()?;
+                if self.peek() == Some(&Token::RParen) {
+                    self.expect_rparen()?;
+                    Ok(Term::Neg(Box::new(a)))
+                } else {
+                    let b = self.parse_term()?;
+                    self.expect_rparen()?;
+                    Ok(Term::Sub(Box::new(a), Box::new(b)))
+                }
+            }
+            "*" => {
+                let args = self.parse_term_list()?;
+                Ok(Term::Mul(args))
+            }
+            "div" => {
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::Div(Box::new(a), Box::new(b)))
+            }
+            "/" => {
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::Div(Box::new(a), Box::new(b)))
+            }
+            "mod" => {
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::Mod(Box::new(a), Box::new(b)))
+            }
+            "abs" => {
+                let t = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::Abs(Box::new(t)))
+            }
+            "<" => {
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::Lt(Box::new(a), Box::new(b)))
+            }
+            "<=" => {
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::Le(Box::new(a), Box::new(b)))
+            }
+            ">" => {
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::Gt(Box::new(a), Box::new(b)))
+            }
+            ">=" => {
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::Ge(Box::new(a), Box::new(b)))
+            }
+            "to_real" => {
+                let t = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::ToReal(Box::new(t)))
+            }
+            "to_int" => {
+                let t = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::ToInt(Box::new(t)))
+            }
+            "is_int" => {
+                let t = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::IsInt(Box::new(t)))
+            }
+
+            // String operations
+            "str.len" => {
+                let t = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::StrLen(Box::new(t)))
+            }
+            "str.++" => {
+                let args = self.parse_term_list()?;
+                Ok(Term::StrConcat(args))
+            }
+            "str.at" => {
+                let s = self.parse_term()?;
+                let i = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::StrAt(Box::new(s), Box::new(i)))
+            }
+            "str.substr" => {
+                let s = self.parse_term()?;
+                let i = self.parse_term()?;
+                let l = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::StrSubstr(Box::new(s), Box::new(i), Box::new(l)))
+            }
+            "str.contains" => {
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::StrContains(Box::new(a), Box::new(b)))
+            }
+            "str.indexof" => {
+                let s = self.parse_term()?;
+                let t = self.parse_term()?;
+                let i = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::StrIndexOf(Box::new(s), Box::new(t), Box::new(i)))
+            }
+            "str.replace" => {
+                let s = self.parse_term()?;
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::StrReplace(Box::new(s), Box::new(a), Box::new(b)))
+            }
+            "str.prefixof" => {
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::StrPrefixOf(Box::new(a), Box::new(b)))
+            }
+            "str.suffixof" => {
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::StrSuffixOf(Box::new(a), Box::new(b)))
+            }
+            "str.to_int" | "str.to.int" => {
+                let t = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::StrToInt(Box::new(t)))
+            }
+            "int.to.str" | "str.from_int" | "str.from.int" => {
+                let t = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::IntToStr(Box::new(t)))
+            }
+            "str.<" => {
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::StrLt(Box::new(a), Box::new(b)))
+            }
+            "str.<=" => {
+                let a = self.parse_term()?;
+                let b = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::StrLe(Box::new(a), Box::new(b)))
+            }
+
             other => Err(ParseError::new(format!("unknown function: {}", other))),
         }
     }
@@ -558,6 +752,13 @@ impl Parser {
                 let term = self.parse_term()?;
                 self.expect_rparen()?;
                 Ok(Term::SignExtend(n, Box::new(term)))
+            }
+            "divisible" => {
+                let n = self.expect_numeral()?;
+                self.expect_rparen()?;
+                let term = self.parse_term()?;
+                self.expect_rparen()?;
+                Ok(Term::Divisible(n, Box::new(term)))
             }
             other => Err(ParseError::new(format!("unknown indexed operator: {}", other))),
         }
@@ -646,6 +847,48 @@ mod tests {
             }
             _ => panic!("expected Assert with Let"),
         }
+    }
+
+    #[test]
+    fn test_declare_int() {
+        let cmds = parse("(declare-const x Int)");
+        match &cmds[0] {
+            Command::DeclareConst(name, sort) => {
+                assert_eq!(name, "x");
+                assert_eq!(*sort, Sort::Int);
+            }
+            _ => panic!("expected DeclareConst"),
+        }
+    }
+
+    #[test]
+    fn test_declare_string() {
+        let cmds = parse("(declare-const s String)");
+        match &cmds[0] {
+            Command::DeclareConst(name, sort) => {
+                assert_eq!(name, "s");
+                assert_eq!(*sort, Sort::String);
+            }
+            _ => panic!("expected DeclareConst"),
+        }
+    }
+
+    #[test]
+    fn test_int_arithmetic() {
+        let cmds = parse("(assert (= (+ x 1) 5))");
+        assert_eq!(cmds.len(), 1);
+    }
+
+    #[test]
+    fn test_string_operations() {
+        let cmds = parse(r#"(assert (= (str.len "hello") 5))"#);
+        assert_eq!(cmds.len(), 1);
+    }
+
+    #[test]
+    fn test_real_literal() {
+        let cmds = parse("(assert (= x 3.14))");
+        assert_eq!(cmds.len(), 1);
     }
 
     #[test]

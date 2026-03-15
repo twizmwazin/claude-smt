@@ -4,6 +4,7 @@ mod lexer;
 mod parser;
 mod sat;
 mod solver;
+mod theories;
 
 use std::env;
 use std::fs;

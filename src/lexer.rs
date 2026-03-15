@@ -7,6 +7,7 @@ pub enum Token {
     Symbol(String),
     Keyword(String),
     Numeral(String),
+    Decimal(String),      // 3.14
     HexLiteral(String),   // #xABCD
     BinLiteral(String),   // #b0101
     StringLiteral(String),
@@ -20,6 +21,7 @@ impl fmt::Display for Token {
             Token::Symbol(s) => write!(f, "{}", s),
             Token::Keyword(k) => write!(f, ":{}", k),
             Token::Numeral(n) => write!(f, "{}", n),
+            Token::Decimal(d) => write!(f, "{}", d),
             Token::HexLiteral(h) => write!(f, "#x{}", h),
             Token::BinLiteral(b) => write!(f, "#b{}", b),
             Token::StringLiteral(s) => write!(f, "\"{}\"", s),
@@ -245,7 +247,22 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        Ok(Some(Token::Numeral(num)))
+        // Check for decimal point
+        if self.peek() == Some(b'.') {
+            num.push('.');
+            self.advance();
+            while let Some(ch) = self.peek() {
+                if ch.is_ascii_digit() {
+                    num.push(ch as char);
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            Ok(Some(Token::Decimal(num)))
+        } else {
+            Ok(Some(Token::Numeral(num)))
+        }
     }
 
     fn read_symbol(&mut self) -> Result<Option<Token>, LexError> {
@@ -328,6 +345,23 @@ mod tests {
                 Token::Symbol("Bool".into()),
                 Token::RParen,
             ]
+        );
+    }
+
+    #[test]
+    fn test_decimal_literal() {
+        let mut lexer = Lexer::new("3.14");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens, vec![Token::Decimal("3.14".into())]);
+    }
+
+    #[test]
+    fn test_numeral_and_decimal() {
+        let mut lexer = Lexer::new("42 3.0");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Numeral("42".into()), Token::Decimal("3.0".into())]
         );
     }
 
