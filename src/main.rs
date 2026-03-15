@@ -1,18 +1,12 @@
-mod ast;
-mod bitvector;
-mod lexer;
-mod parser;
-mod sat;
-mod solver;
-mod theories;
-
 use std::env;
 use std::fs;
+
+use claude_smt::solver::SmtSolver;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let mut smt = solver::SmtSolver::new();
+    let mut smt = SmtSolver::new();
 
     if args.len() > 1 {
         // File mode: read and process an SMT-LIB file

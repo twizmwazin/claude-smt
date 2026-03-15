@@ -5,3 +5,16 @@ edition = "2021"
 description = "An SMT solver supporting Boolean and bitvector theories with SMT-LIB interface"
 
 [dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+
+[features]
+default = []
+python = ["pyo3"]
+
+[lib]
+name = "claude_smt"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "claude-smt"
+path = "src/main.rs"
