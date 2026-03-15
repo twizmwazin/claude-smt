@@ -1,0 +1,7 @@
+[package]
+name = "claude-smt"
+version = "0.1.0"
+edition = "2021"
+description = "An SMT solver supporting Boolean and bitvector theories with SMT-LIB interface"
+
+[dependencies]
