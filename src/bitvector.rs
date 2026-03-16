@@ -274,46 +274,46 @@ impl<'a> BitBlaster<'a> {
         result
     }
 
-    pub fn bvudiv(&mut self, a: &BitVec, b: &BitVec) -> BitVec {
+    /// Compute both quotient and remainder for unsigned division.
+    /// Returns (quotient, remainder) sharing the same q,r variables so that
+    /// the Euclidean property a = b*q + r always holds.
+    pub fn bvdivrem(&mut self, a: &BitVec, b: &BitVec) -> (BitVec, BitVec) {
         assert_eq!(a.width(), b.width());
         let w = a.width();
         let q = BitVec::new_variable(self.solver, w);
         let r = BitVec::new_variable(self.solver, w);
 
+        // Core constraint: a = b*q + r
         let bq = self.bvmul(b, &q);
         let bq_r = self.bvadd(&bq, &r);
         self.assert_eq(a, &bq_r);
 
         let zero_const = BitVec::from_constant(self.solver, 0, w);
         let b_zero = self.eq(b, &zero_const);
+
+        // When b != 0: r < b (remainder is bounded)
         let r_lt_b = self.bvult_lit(&r, b);
         self.solver.add_clause(vec![b_zero, r_lt_b]);
 
+        // When b == 0: q = all_ones (SMT-LIB semantics for division by zero)
         let all_ones = BitVec::from_constant(self.solver, (1u64 << w) - 1, w);
         let q_eq_ones = self.eq(&q, &all_ones);
         self.solver.add_clause(vec![-b_zero, q_eq_ones]);
 
+        // When b == 0: r = a (SMT-LIB semantics for remainder by zero)
+        let r_eq_a = self.eq(&r, a);
+        self.solver.add_clause(vec![-b_zero, r_eq_a]);
+
+        (q, r)
+    }
+
+    pub fn bvudiv(&mut self, a: &BitVec, b: &BitVec) -> BitVec {
+        let (q, _r) = self.bvdivrem(a, b);
         q
     }
 
     pub fn bvurem(&mut self, a: &BitVec, b: &BitVec) -> BitVec {
-        assert_eq!(a.width(), b.width());
-        let w = a.width();
-        let q = BitVec::new_variable(self.solver, w);
-        let r = BitVec::new_variable(self.solver, w);
-
-        let bq = self.bvmul(b, &q);
-        let bq_r = self.bvadd(&bq, &r);
-        self.assert_eq(a, &bq_r);
-
-        let zero_const = BitVec::from_constant(self.solver, 0, w);
-        let b_zero = self.eq(b, &zero_const);
-        let r_lt_b = self.bvult_lit(&r, b);
-        self.solver.add_clause(vec![b_zero, r_lt_b]);
-
-        let r_eq_a = self.eq(&r, a);
-        self.solver.add_clause(vec![-b_zero, r_eq_a]);
-
+        let (_q, r) = self.bvdivrem(a, b);
         r
     }
 

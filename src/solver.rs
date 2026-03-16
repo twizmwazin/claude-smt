@@ -36,6 +36,11 @@ pub struct SmtSolver {
     logic: Option<String>,
     produce_models: bool,
     theory_assertions: Vec<Term>,
+    /// Cache for bvudiv/bvurem: ensures that div and rem on the same operands
+    /// share the same quotient/remainder variables (Euclidean property).
+    divrem_cache: HashMap<(Vec<Lit>, Vec<Lit>), (BitVec, BitVec)>,
+    /// Cache for BV term encoding: avoids re-encoding the same (canonicalized) term.
+    bv_term_cache: HashMap<Term, BitVec>,
 }
 
 impl SmtSolver {
@@ -50,6 +55,8 @@ impl SmtSolver {
             logic: None,
             produce_models: false,
             theory_assertions: Vec::new(),
+            divrem_cache: HashMap::new(),
+            bv_term_cache: HashMap::new(),
         }
     }
 
@@ -351,6 +358,8 @@ impl SmtSolver {
                 self.var_sorts.clear();
                 self.stack.clear();
                 self.theory_assertions.clear();
+                self.divrem_cache.clear();
+                self.bv_term_cache.clear();
                 Ok(None)
             }
             Command::Exit => Ok(None),
@@ -708,8 +717,115 @@ impl SmtSolver {
         }
     }
 
+    /// Canonicalize a BV term: sort operands of commutative ops so that
+    /// e.g. (bvmul x y) and (bvmul y x) become the same term.
+    fn canonicalize_bv_term(term: &Term) -> Term {
+        match term {
+            // Commutative BV ops: sort operands for canonical form
+            Term::BvAdd(a, b) => {
+                let ca = Self::canonicalize_bv_term(a);
+                let cb = Self::canonicalize_bv_term(b);
+                if format!("{:?}", ca) <= format!("{:?}", cb) {
+                    Term::BvAdd(Box::new(ca), Box::new(cb))
+                } else {
+                    Term::BvAdd(Box::new(cb), Box::new(ca))
+                }
+            }
+            Term::BvMul(a, b) => {
+                let ca = Self::canonicalize_bv_term(a);
+                let cb = Self::canonicalize_bv_term(b);
+                if format!("{:?}", ca) <= format!("{:?}", cb) {
+                    Term::BvMul(Box::new(ca), Box::new(cb))
+                } else {
+                    Term::BvMul(Box::new(cb), Box::new(ca))
+                }
+            }
+            Term::BvAnd(a, b) => {
+                let ca = Self::canonicalize_bv_term(a);
+                let cb = Self::canonicalize_bv_term(b);
+                if format!("{:?}", ca) <= format!("{:?}", cb) {
+                    Term::BvAnd(Box::new(ca), Box::new(cb))
+                } else {
+                    Term::BvAnd(Box::new(cb), Box::new(ca))
+                }
+            }
+            Term::BvOr(a, b) => {
+                let ca = Self::canonicalize_bv_term(a);
+                let cb = Self::canonicalize_bv_term(b);
+                if format!("{:?}", ca) <= format!("{:?}", cb) {
+                    Term::BvOr(Box::new(ca), Box::new(cb))
+                } else {
+                    Term::BvOr(Box::new(cb), Box::new(ca))
+                }
+            }
+            Term::BvXor(a, b) => {
+                let ca = Self::canonicalize_bv_term(a);
+                let cb = Self::canonicalize_bv_term(b);
+                if format!("{:?}", ca) <= format!("{:?}", cb) {
+                    Term::BvXor(Box::new(ca), Box::new(cb))
+                } else {
+                    Term::BvXor(Box::new(cb), Box::new(ca))
+                }
+            }
+            // Non-commutative ops: canonicalize children only
+            Term::BvNot(t) => Term::BvNot(Box::new(Self::canonicalize_bv_term(t))),
+            Term::BvNeg(t) => Term::BvNeg(Box::new(Self::canonicalize_bv_term(t))),
+            Term::BvSub(a, b) => Term::BvSub(
+                Box::new(Self::canonicalize_bv_term(a)),
+                Box::new(Self::canonicalize_bv_term(b)),
+            ),
+            Term::BvUdiv(a, b) => Term::BvUdiv(
+                Box::new(Self::canonicalize_bv_term(a)),
+                Box::new(Self::canonicalize_bv_term(b)),
+            ),
+            Term::BvUrem(a, b) => Term::BvUrem(
+                Box::new(Self::canonicalize_bv_term(a)),
+                Box::new(Self::canonicalize_bv_term(b)),
+            ),
+            Term::BvShl(a, b) => Term::BvShl(
+                Box::new(Self::canonicalize_bv_term(a)),
+                Box::new(Self::canonicalize_bv_term(b)),
+            ),
+            Term::BvLshr(a, b) => Term::BvLshr(
+                Box::new(Self::canonicalize_bv_term(a)),
+                Box::new(Self::canonicalize_bv_term(b)),
+            ),
+            Term::BvAshr(a, b) => Term::BvAshr(
+                Box::new(Self::canonicalize_bv_term(a)),
+                Box::new(Self::canonicalize_bv_term(b)),
+            ),
+            Term::Concat(a, b) => Term::Concat(
+                Box::new(Self::canonicalize_bv_term(a)),
+                Box::new(Self::canonicalize_bv_term(b)),
+            ),
+            Term::Extract { high, low, term } => Term::Extract {
+                high: *high, low: *low,
+                term: Box::new(Self::canonicalize_bv_term(term)),
+            },
+            Term::ZeroExtend(n, t) => Term::ZeroExtend(*n, Box::new(Self::canonicalize_bv_term(t))),
+            Term::SignExtend(n, t) => Term::SignExtend(*n, Box::new(Self::canonicalize_bv_term(t))),
+            // Leaves and non-BV terms: return as-is
+            _ => term.clone(),
+        }
+    }
+
     /// Encode a term that should evaluate to a bitvector
     fn encode_bv_term(&mut self, term: &Term) -> Result<BitVec, String> {
+        // Canonicalize and check cache for non-trivial terms
+        let use_cache = !matches!(term, Term::BitVecLiteral { .. } | Term::Variable(_));
+        if use_cache {
+            let canonical = Self::canonicalize_bv_term(term);
+            if let Some(cached) = self.bv_term_cache.get(&canonical) {
+                return Ok(cached.clone());
+            }
+            let result = self.encode_bv_term_inner(&canonical)?;
+            self.bv_term_cache.insert(canonical, result.clone());
+            return Ok(result);
+        }
+        self.encode_bv_term_inner(term)
+    }
+
+    fn encode_bv_term_inner(&mut self, term: &Term) -> Result<BitVec, String> {
         match term {
             Term::BitVecLiteral { value, width } => {
                 if *width == 0 {
@@ -783,14 +899,26 @@ impl SmtSolver {
             Term::BvUdiv(a, b) => {
                 let bva = self.encode_bv_term(a)?;
                 let bvb = self.encode_bv_term(b)?;
+                let key = (bva.bits.clone(), bvb.bits.clone());
+                if let Some((q, _r)) = self.divrem_cache.get(&key) {
+                    return Ok(q.clone());
+                }
                 let mut bb = BitBlaster::new(&mut self.sat);
-                Ok(bb.bvudiv(&bva, &bvb))
+                let (q, r) = bb.bvdivrem(&bva, &bvb);
+                self.divrem_cache.insert(key, (q.clone(), r));
+                Ok(q)
             }
             Term::BvUrem(a, b) => {
                 let bva = self.encode_bv_term(a)?;
                 let bvb = self.encode_bv_term(b)?;
+                let key = (bva.bits.clone(), bvb.bits.clone());
+                if let Some((_q, r)) = self.divrem_cache.get(&key) {
+                    return Ok(r.clone());
+                }
                 let mut bb = BitBlaster::new(&mut self.sat);
-                Ok(bb.bvurem(&bva, &bvb))
+                let (q, r) = bb.bvdivrem(&bva, &bvb);
+                self.divrem_cache.insert(key, (q, r.clone()));
+                Ok(r)
             }
             Term::BvSdiv(a, b) => {
                 let bva = self.encode_bv_term(a)?;

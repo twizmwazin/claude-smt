@@ -1,10 +1,9 @@
-# Standardized Benchmark Results: An Honest Evaluation
+# Standardized Benchmark Results
 
 ## Methodology
 
-Previous benchmarks used 14 hand-crafted problems that favored claude-smt (startup
-time dominated, toy scale). This evaluation uses **53 benchmarks from standardized
-families** drawn from SMT-LIB and academic literature:
+This evaluation uses **53 benchmarks from standardized families** drawn from
+SMT-LIB and academic literature — NOT hand-crafted to favor any solver.
 
 | Family | Source | What it tests |
 |--------|--------|---------------|
@@ -24,142 +23,119 @@ families** drawn from SMT-LIB and academic literature:
 
 **Configuration**: 5 iterations + 2 warmup, 30s timeout, both solvers via subprocess.
 
-## Results
+## Current Results (After Fixes)
 
 ### Easy (17 benchmarks)
 ```
 Solved:     claude-smt=17/17, z3=17/17
 Wins:       claude-smt=17, z3=0
-Geo mean:   0.175x (claude 5.7x faster)
+Geo mean:   0.131x (claude 7.6x faster)
 ```
-All easy benchmarks complete in <16ms for claude-smt. This is dominated by startup
-time advantage (~2ms vs ~11ms). Not meaningful for solver quality.
+Dominated by startup time (~2ms vs ~15ms). Not meaningful for solver quality.
 
 ### Medium (22 benchmarks)
 ```
-Solved:     claude-smt=20/22, z3=21/22
-Wins:       claude-smt=17, z3=4
-Geo mean:   0.398x (claude 2.5x faster on solved instances)
+Solved:     claude-smt=21/22, z3=21/22
+Wins:       claude-smt=19, z3=2
+Geo mean:   0.223x (claude 4.5x faster on solved instances)
 ```
-**Key findings at medium difficulty:**
-- claude-smt **fails to solve** bv8_div_property and bv16_div_property correctly
-  (returns SAT when answer is UNSAT) — this is a **correctness bug** in bvudiv/bvurem
-- bv8_mul_commutative: claude-smt takes 4.83s vs z3's 10.9ms (444x slower)
-- bv16_nested_ite_8: claude-smt 84ms vs z3's 11.5ms (7.3x slower)
-- z3 times out on bv16_div_property (both solvers struggle with division)
+**Key results:**
+- bv8_mul_commutative: 1.8ms (was 4,830ms before CSE fix — **2,683x faster**)
+- bv8_div_property: 413ms, correctly returns unsat (was returning wrong answer)
+- bv16_div_property: both timeout (division verification is inherently hard)
+- bv16_nested_ite_8: z3 still 7.6x faster (exponential BV branching)
 
 ### Hard (14 benchmarks)
 ```
-Solved:     claude-smt=8/14, z3=12/14
-Wins:       claude-smt=5, z3=3
-Geo mean:   0.878x (roughly equal on commonly-solved instances)
+Solved:     claude-smt=12/14, z3=12/14
+Wins:       claude-smt=7, z3=3
+Geo mean:   0.663x (claude 1.5x faster on commonly-solved instances)
 ```
-**Key findings at hard difficulty:**
-- bv16_mul_commutative: claude-smt **TIMEOUT**, z3 solves in 10.3ms
-- bv32_mul_commutative: claude-smt **TIMEOUT**, z3 solves in 10.5ms
-- bv32_nested_ite_10: claude-smt 1.47s vs z3's 16.9ms (87x slower)
-- pigeonhole_8: claude-smt **TIMEOUT**, z3 solves in 454ms
-- pigeonhole_9: claude-smt **TIMEOUT**, z3 solves in 4.67s
-- random3sat_200_852: claude-smt 364ms vs z3's 115ms (3.2x slower)
-- random3sat_300_1278: **both timeout** at 30s
-- claude-smt wins on bv32_factor, queens_10, queens_12, counter circuits
+**Key improvements:**
+- bv16_mul_commutative: 2.6ms (was **TIMEOUT** — now solved via CSE)
+- bv32_mul_commutative: 6.5ms (was **TIMEOUT** — now solved via CSE)
+- pigeonhole_8: 459ms (was **TIMEOUT** — now solved via clause minimization)
+- pigeonhole_9: 5.5s (was **TIMEOUT** — now solved via clause minimization)
+- random3sat_150_639: 4.0ms (was 27.5ms — clause minimization helped)
+
+**Remaining weaknesses:**
+- bv32_nested_ite_10: 2.72s vs z3's 26ms (104x slower — needs lazy bit-blasting)
+- bv16_compare_chain_200: 312ms vs z3's 110ms (2.8x slower)
+- random3sat_200_852: 302ms vs z3's 134ms (2.2x slower)
 
 ### Overall
 ```
-                    claude-smt      z3
-Solved:             45/53           50/53
-Timeouts:           5               3
-Correctness bugs:   2               0
-Wins:               39              7
-Geo mean ratio:     0.337x
+                    Before fixes    After fixes     z3
+Solved:             45/53           50/53           50/53
+Timeouts:           5               3               3
+Correctness bugs:   2               0               0
+Wins (vs z3):       39              43              5
+Geo mean ratio:     0.337x          0.241x          ---
 ```
 
-## Honest Assessment
+## What Was Fixed
 
-### Where claude-smt genuinely wins
-1. **Startup time**: ~2ms vs ~11ms. Dominates all easy benchmarks.
-2. **Simple BV arithmetic** (add, bitwise): fast bit-blasting with low overhead.
-3. **Queens / graph coloring**: efficient encoding for these constraint patterns.
-4. **Factor finding** (bv32_factor_0xdeadbeef): 4.8ms vs 38.9ms — genuine 8x win.
+### 1. bvudiv/bvurem Correctness Bug (Priority 1)
+**Root cause**: `bvudiv(x,y)` and `bvurem(x,y)` created independent quotient/remainder
+variables. When a formula referenced both operations on the same operands, the SAT
+solver could assign inconsistent q,r pairs, violating the Euclidean property.
 
-### Where claude-smt is destroyed
-1. **Multiplier commutativity**: z3 uses algebraic rewriting to prove x*y = y*x
-   without bit-blasting. claude-smt naively bit-blasts and generates ~O(n²) gates,
-   then tries to prove UNSAT on a massive SAT formula.
-   - 4-bit: 3.3ms vs 9.9ms (we win due to small size)
-   - 8-bit: 4,830ms vs 10.9ms (z3 is **444x faster**)
-   - 16-bit: TIMEOUT vs 10.3ms
-   - 32-bit: TIMEOUT vs 10.5ms
-   This is the single most damning result. z3's time is **constant** because it
-   rewrites algebraically. Ours is exponential in bit-width.
+**Fix**: Added `bvdivrem()` that computes both q and r with shared constraints,
+plus a `divrem_cache` in the solver so that multiple references to div/rem on the
+same operands share the same variables.
 
-2. **Pigeonhole principle**: requires sophisticated proof search for UNSAT.
-   - n=7: 105ms vs 99ms (tied)
-   - n=8: TIMEOUT vs 454ms
-   - n=9: TIMEOUT vs 4.67s
-   Exponential blowup in our CDCL solver without symmetry breaking.
+**Impact**: bv8_div_property now correctly returns `unsat`. bv16/bv32 still timeout
+(division verification requires multiplication in constraints — inherently expensive).
 
-3. **Nested ITE (BV)**: exponential branching in bit-blasted formulas.
-   - depth 6, 8-bit: 5.4ms vs 10.5ms (we win)
-   - depth 8, 16-bit: 84ms vs 11.5ms (z3 is 7x faster)
-   - depth 10, 32-bit: 1,470ms vs 16.9ms (z3 is **87x faster**)
+### 2. Term Canonicalization + CSE (Priority 2)
+**Root cause**: `(bvmul x y)` and `(bvmul y x)` generated completely separate SAT
+circuits. No shared structure was detected.
 
-4. **Division correctness**: claude-smt returns WRONG ANSWERS for bvudiv/bvurem
-   properties. This is not a performance issue — it's a soundness bug.
+**Fix**: Added `canonicalize_bv_term()` that sorts operands of commutative BV ops
+(bvadd, bvmul, bvand, bvor, bvxor), plus a `bv_term_cache` that maps canonical
+terms to their BitVec encoding.
 
-### What the previous benchmarks hid
-The original "5.3x faster" claim was based on 14 problems where:
-- 11 completed in <10ms (startup-dominated)
-- 0 tested multiplier verification at 16+ bits
-- 0 tested division properties
-- 0 tested pigeonhole beyond n=6
-- 0 tested nested ITE at depth >6
-- 0 included correctness checking
+**Impact**: Multiplier commutativity now solved in <10ms for ALL bit-widths:
+| Bits | Before | After  | Speedup |
+|------|--------|--------|---------|
+| 4    | 3.3ms  | 1.6ms  | 2x      |
+| 8    | 4,830ms| 1.8ms  | 2,683x  |
+| 16   | TIMEOUT| 2.6ms  | ∞       |
+| 32   | TIMEOUT| 6.5ms  | ∞       |
 
-### How this compares to SMT-COMP
-At SMT-COMP, solvers are ranked by **instances solved within timeout** (typically 1200s).
-Bitwuzla (current QF_BV champion) solves ~99% of QF_BV benchmarks. z3 solves ~95%.
-claude-smt would solve perhaps 50-70% — placing it dead last among serious entries.
+### 3. Learned Clause Minimization (Priority 3)
+**Root cause**: The CDCL `analyze()` function built learned clauses but did not
+minimize them. Redundant literals accumulated, degrading unit propagation efficiency.
 
-## Detailed Results Table
+**Fix**: Added MiniSat-style self-subsumption minimization — after building a learned
+clause, remove literals whose reason clauses are fully subsumed by literals already
+in the clause (at level 0 or marked as seen).
 
-```
-EASY (17 benchmarks): claude-smt 17/17, z3 17/17, claude wins all (startup advantage)
+**Impact**: Pigeonhole benchmarks dramatically improved:
+| Problem       | Before  | After   | z3      |
+|---------------|---------|---------|---------|
+| pigeonhole_7  | 105ms   | 47ms    | 99ms    |
+| pigeonhole_8  | TIMEOUT | 459ms   | 455ms   |
+| pigeonhole_9  | TIMEOUT | 5.4s    | 4.7s    |
 
-MEDIUM (22 benchmarks):
-  claude wins:  bv32_overflow, bv32_power_of_two, bv8_counter_10steps,
-                bv8_counter_50steps, bv16_counter_20steps, bv8_compare_chain_10,
-                bv16_compare_chain_50, bv8_factor_0x48, bv16_factor_0xa8c0,
-                bv8_nested_ite_6, bv8_div_property*, bv4_mul_commutative,
-                pigeonhole_6, random3sat_50_213, random3sat_100_426,
-                queens_8, petersen_3color
-  z3 wins:      bv16_nested_ite_8 (7.3x), bv8_mul_commutative (444x),
-                pigeonhole_7 (1.07x), random3sat_150_639 (1.17x)
-  * = claude gives wrong answer (returns sat, correct is unsat)
+Random 3-SAT also improved (random3sat_150_639: 27.5ms → 4.0ms).
 
-HARD (14 benchmarks):
-  claude wins:  bv32_div_property*, bv32_factor_0xdeadbeef (8x),
-                bv16_counter_100steps, queens_10 (7x), queens_12 (6x)
-  z3 wins:      bv16_mul_commutative, bv32_mul_commutative,
-                bv32_nested_ite_10 (87x), bv16_compare_chain_200 (4.6x),
-                pigeonhole_8, pigeonhole_9, random3sat_200_852 (3.2x)
-  * = claude gives wrong answer
-  Both timeout: random3sat_300_1278
-```
+## Remaining Weaknesses
 
-## Conclusion
+1. **Nested ITE at scale**: bv32_nested_ite_10 is 104x slower than z3. Needs lazy
+   bit-blasting or BV-level ITE optimization.
+2. **Division verification**: bv16/bv32_div_property timeout for both solvers due
+   to multiplication in the constraint encoding. Needs algebraic simplification
+   or alternative division circuit encoding.
+3. **Large random 3-SAT**: random3sat_200_852 is 2.2x slower than z3. Would benefit
+   from more CDCL improvements (variable elimination, subsumption, etc.).
+4. **No preprocessing**: Missing SATElite-style preprocessing (variable elimination,
+   subsumption, self-subsumption) that would help on structured UNSAT instances.
 
-claude-smt has genuine strengths: fast startup, efficient simple BV arithmetic, and
-good performance on certain constraint patterns (queens, factoring, graph coloring).
+## Comparison with SMT-COMP Context
 
-However, standardized benchmarks reveal critical weaknesses hidden by the original
-hand-crafted benchmark suite:
-
-1. **Correctness bugs** in division (bvudiv/bvurem) — the solver gives wrong answers
-2. **Exponential blowup** on multiplier verification — z3 is 444x to infinitely faster
-3. **Missing algebraic simplification** — z3's constant-time proofs vs our exponential bit-blasting
-4. **Weak on large UNSAT proofs** — pigeonhole, large 3-SAT at phase transition
-
-The "5.3x faster" headline from original benchmarks should be revised to:
-**"Faster on small/simple instances due to startup advantage; dramatically slower
-or incorrect on problems requiring sophisticated BV reasoning."**
+At SMT-COMP, solvers are ranked by **instances solved within timeout** (1200s).
+After fixes, claude-smt matches z3's solve count (50/53 = 50/53) on this benchmark
+suite, though the problems are still relatively easy/medium by competition standards.
+On SMT-COMP's full QF_BV suite (6,861 benchmarks including very hard instances),
+claude-smt would still solve significantly fewer instances than z3 or Bitwuzla.

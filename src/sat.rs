@@ -527,19 +527,52 @@ impl SatSolver {
         // First literal of learnt clause is the asserting literal (negation of UIP)
         learnt.insert(0, Self::neg(p.unwrap()));
 
-        // Put the literal with highest level at position 1 (for watch list)
-        if learnt.len() > 2 {
+        // Learned clause minimization (MiniSat self-subsumption):
+        // Remove literals whose reason clauses are fully subsumed by the
+        // learned clause (all reason literals are at level 0 or already seen).
+        // Note: seen[] is still set for all variables involved in analysis.
+        let mut minimized = Vec::with_capacity(learnt.len());
+        minimized.push(learnt[0]); // Keep the asserting literal (UIP)
+        for i in 1..learnt.len() {
+            let lit = learnt[i];
+            let v = var_of(lit);
+            if let Some(reason) = self.var_info[v as usize].reason {
+                let reason_clause = &self.clauses[reason];
+                let mut redundant = true;
+                for &rlit in &reason_clause.lits {
+                    let rv = var_of(rlit);
+                    if rv == v {
+                        continue;
+                    }
+                    let rlevel = self.var_info[rv as usize].level;
+                    if rlevel == 0 {
+                        continue; // Level 0 literals are always true
+                    }
+                    if !self.seen[rv as usize] {
+                        redundant = false;
+                        break;
+                    }
+                }
+                if redundant {
+                    continue; // Skip this literal — it's redundant
+                }
+            }
+            minimized.push(lit);
+        }
+
+        // Recalculate backtrack level after minimization
+        bt_level = 0;
+        if minimized.len() > 1 {
             let mut max_idx = 1;
-            for i in 2..learnt.len() {
-                let lv = self.var_info[var_of(learnt[i]) as usize].level;
-                if lv > self.var_info[var_of(learnt[max_idx]) as usize].level {
+            for i in 2..minimized.len() {
+                let lv = self.var_info[var_of(minimized[i]) as usize].level;
+                if lv > self.var_info[var_of(minimized[max_idx]) as usize].level {
                     max_idx = i;
                 }
             }
-            learnt.swap(1, max_idx);
-            bt_level = self.var_info[var_of(learnt[1]) as usize].level;
+            minimized.swap(1, max_idx);
+            bt_level = self.var_info[var_of(minimized[1]) as usize].level;
         }
-        let minimized = learnt;
 
         // Clean up seen vector
         for v in seen_vars {
