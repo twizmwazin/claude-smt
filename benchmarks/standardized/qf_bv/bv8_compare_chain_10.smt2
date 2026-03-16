@@ -1,0 +1,26 @@
+; SMT-LIB benchmark: bv8_compare_chain_10
+; Source: Generated from standardized benchmark family
+; Expected: sat
+; Category: standardized
+(set-logic QF_BV)
+(declare-const x0 (_ BitVec 8))
+(declare-const x1 (_ BitVec 8))
+(declare-const x2 (_ BitVec 8))
+(declare-const x3 (_ BitVec 8))
+(declare-const x4 (_ BitVec 8))
+(declare-const x5 (_ BitVec 8))
+(declare-const x6 (_ BitVec 8))
+(declare-const x7 (_ BitVec 8))
+(declare-const x8 (_ BitVec 8))
+(declare-const x9 (_ BitVec 8))
+(assert (bvult x0 x1))
+(assert (bvult x1 x2))
+(assert (bvult x2 x3))
+(assert (bvult x3 x4))
+(assert (bvult x4 x5))
+(assert (bvult x5 x6))
+(assert (bvult x6 x7))
+(assert (bvult x7 x8))
+(assert (bvult x8 x9))
+(check-sat)
+(exit)
