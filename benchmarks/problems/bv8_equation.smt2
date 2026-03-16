@@ -1,0 +1,7 @@
+(set-logic QF_BV)
+(declare-const x (_ BitVec 8))
+(declare-const y (_ BitVec 8))
+(assert (= (bvadd x y) #x1A))
+(assert (= (bvsub x y) #x04))
+(check-sat)
+(exit)

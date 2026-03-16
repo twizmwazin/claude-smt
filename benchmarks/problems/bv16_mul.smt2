@@ -1,0 +1,5 @@
+(set-logic QF_BV)
+(declare-const x (_ BitVec 16))
+(assert (= (bvmul x #x0007) #x0015))
+(check-sat)
+(exit)
