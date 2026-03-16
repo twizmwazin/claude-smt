@@ -2,11 +2,9 @@
 //!
 //! Implements Conflict-Driven Clause Learning with:
 //! - Two-watched-literal scheme for unit propagation
-//! - First-UIP conflict analysis
-//! - VSIDS decision heuristic
+//! - First-UIP conflict analysis with reusable seen vector
+//! - VSIDS decision heuristic with binary heap
 //! - Non-chronological backtracking
-
-use std::collections::HashMap;
 
 /// A literal is a variable (positive integer) possibly negated.
 /// Positive = variable, Negative = negation.
@@ -14,14 +12,24 @@ pub type Lit = i32;
 pub type Var = u32;
 pub type ClauseId = usize;
 
-#[inline]
+#[inline(always)]
 pub fn var_of(lit: Lit) -> Var {
     lit.unsigned_abs()
 }
 
-#[inline]
+#[inline(always)]
 pub fn sign(lit: Lit) -> bool {
     lit > 0
+}
+
+/// Map a literal to a watch list index: positive lit l -> 2*(l-1), negative lit -l -> 2*(l-1)+1
+#[inline(always)]
+fn lit_index(lit: Lit) -> usize {
+    if lit > 0 {
+        (lit as usize - 1) * 2
+    } else {
+        ((-lit) as usize - 1) * 2 + 1
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,17 +59,125 @@ struct VarInfo {
     reason: Option<ClauseId>,
 }
 
+/// Binary heap for VSIDS variable ordering.
+/// Maintains a max-heap of unassigned variables ordered by activity.
+struct VarHeap {
+    heap: Vec<Var>,
+    indices: Vec<usize>, // indices[v] = position in heap (usize::MAX if not in heap)
+}
+
+impl VarHeap {
+    fn new() -> Self {
+        VarHeap {
+            heap: Vec::new(),
+            indices: vec![usize::MAX], // index 0 unused
+        }
+    }
+
+    fn grow_to(&mut self, n: usize) {
+        while self.indices.len() <= n {
+            let v = self.indices.len() as Var;
+            self.indices.push(self.heap.len());
+            self.heap.push(v);
+        }
+    }
+
+    fn is_in_heap(&self, v: Var) -> bool {
+        (v as usize) < self.indices.len() && self.indices[v as usize] != usize::MAX
+    }
+
+    fn insert(&mut self, v: Var, activity: &[f64]) {
+        if self.is_in_heap(v) {
+            return;
+        }
+        let pos = self.heap.len();
+        self.heap.push(v);
+        self.indices[v as usize] = pos;
+        self.sift_up(pos, activity);
+    }
+
+    fn pop_max(&mut self, activity: &[f64]) -> Option<Var> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        let max_var = self.heap[0];
+        let last = self.heap.len() - 1;
+        self.swap(0, last);
+        self.indices[max_var as usize] = usize::MAX;
+        self.heap.pop();
+        if !self.heap.is_empty() {
+            self.sift_down(0, activity);
+        }
+        Some(max_var)
+    }
+
+    fn update(&mut self, v: Var, activity: &[f64]) {
+        if self.is_in_heap(v) {
+            let pos = self.indices[v as usize];
+            self.sift_up(pos, activity);
+        }
+    }
+
+    fn swap(&mut self, i: usize, j: usize) {
+        self.heap.swap(i, j);
+        self.indices[self.heap[i] as usize] = i;
+        self.indices[self.heap[j] as usize] = j;
+    }
+
+    fn sift_up(&mut self, mut pos: usize, activity: &[f64]) {
+        let v = self.heap[pos];
+        while pos > 0 {
+            let parent = (pos - 1) / 2;
+            let pv = self.heap[parent];
+            if activity[v as usize] <= activity[pv as usize] {
+                break;
+            }
+            self.swap(pos, parent);
+            pos = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut pos: usize, activity: &[f64]) {
+        let n = self.heap.len();
+        loop {
+            let left = 2 * pos + 1;
+            if left >= n {
+                break;
+            }
+            let right = left + 1;
+            let mut max_child = left;
+            if right < n
+                && activity[self.heap[right] as usize] > activity[self.heap[left] as usize]
+            {
+                max_child = right;
+            }
+            if activity[self.heap[pos] as usize] >= activity[self.heap[max_child] as usize] {
+                break;
+            }
+            self.swap(pos, max_child);
+            pos = max_child;
+        }
+    }
+}
+
 pub struct SatSolver {
     num_vars: u32,
     clauses: Vec<Clause>,
-    watches: HashMap<Lit, Vec<ClauseId>>,
+    /// Watch lists indexed by lit_index(lit). watches[lit_index(-l)] = clauses watching literal -l.
+    watches: Vec<Vec<ClauseId>>,
     var_info: Vec<VarInfo>,
     trail: Vec<Lit>,
-    trail_lim: Vec<usize>,  // decision level boundaries
+    trail_lim: Vec<usize>,
     activity: Vec<f64>,
     var_inc: f64,
     propagation_queue: Vec<Lit>,
-    ok: bool, // set to false on top-level conflict
+    ok: bool,
+    /// Reusable seen vector for conflict analysis (avoids allocation per conflict)
+    seen: Vec<bool>,
+    /// VSIDS variable ordering heap
+    var_heap: VarHeap,
+    /// Cached false literal (set once after first new_var call)
+    false_lit: Option<Lit>,
 }
 
 impl SatSolver {
@@ -69,7 +185,7 @@ impl SatSolver {
         SatSolver {
             num_vars: 0,
             clauses: Vec::new(),
-            watches: HashMap::new(),
+            watches: Vec::new(),
             var_info: vec![VarInfo {
                 value: LBool::Undef,
                 level: 0,
@@ -81,6 +197,9 @@ impl SatSolver {
             var_inc: 1.0,
             propagation_queue: Vec::new(),
             ok: true,
+            seen: vec![false],
+            var_heap: VarHeap::new(),
+            false_lit: None,
         }
     }
 
@@ -93,6 +212,11 @@ impl SatSolver {
             reason: None,
         });
         self.activity.push(0.0);
+        self.seen.push(false);
+        // Each variable has two literals: +v and -v, needing two watch list slots
+        self.watches.push(Vec::new()); // for positive literal
+        self.watches.push(Vec::new()); // for negative literal
+        self.var_heap.grow_to(v as usize);
         v
     }
 
@@ -102,29 +226,34 @@ impl SatSolver {
         }
     }
 
+    /// Get a literal that evaluates to false in the model. Reuses the same variable.
+    /// This is a positive literal for a variable forced to false: model_value(v)=false, so lit=v evaluates false.
+    pub fn get_false_lit(&mut self) -> Lit {
+        if let Some(fl) = self.false_lit {
+            return fl;
+        }
+        let v = self.new_var();
+        let lit = v as Lit;
+        // Force v = false
+        self.add_clause(vec![-lit]);
+        // The positive literal `lit` evaluates to false in the model
+        self.false_lit = Some(lit);
+        lit
+    }
+
+    /// Get a literal that evaluates to true in the model (negation of false var).
+    pub fn get_true_lit(&mut self) -> Lit {
+        -self.get_false_lit()
+    }
+
+    #[inline(always)]
     fn decision_level(&self) -> u32 {
         self.trail_lim.len() as u32
     }
 
+    #[inline(always)]
     fn value_lit(&self, lit: Lit) -> LBool {
-        let v = var_of(lit);
-        match self.var_info[v as usize].value {
-            LBool::Undef => LBool::Undef,
-            LBool::True => {
-                if sign(lit) {
-                    LBool::True
-                } else {
-                    LBool::False
-                }
-            }
-            LBool::False => {
-                if sign(lit) {
-                    LBool::False
-                } else {
-                    LBool::True
-                }
-            }
-        }
+        Self::value_lit_raw(&self.var_info, lit)
     }
 
     pub fn add_clause(&mut self, lits: Vec<Lit>) -> bool {
@@ -148,9 +277,11 @@ impl SatSolver {
         }
 
         let cid = self.clauses.len();
-        // Watch first two literals
-        self.watches.entry(Self::neg(lits[0])).or_default().push(cid);
-        self.watches.entry(Self::neg(lits[1])).or_default().push(cid);
+        // Watch first two literals: watch[neg(lits[0])] and watch[neg(lits[1])]
+        let idx0 = lit_index(-lits[0]);
+        let idx1 = lit_index(-lits[1]);
+        self.watches[idx0].push(cid);
+        self.watches[idx1].push(cid);
 
         self.clauses.push(Clause {
             lits,
@@ -159,7 +290,7 @@ impl SatSolver {
         true
     }
 
-    #[inline]
+    #[inline(always)]
     fn neg(lit: Lit) -> Lit {
         -lit
     }
@@ -183,15 +314,17 @@ impl SatSolver {
     }
 
     /// Evaluate a literal against var_info directly (avoids borrow issues)
+    #[inline(always)]
     fn value_lit_raw(var_info: &[VarInfo], lit: Lit) -> LBool {
         let v = var_of(lit);
-        match var_info[v as usize].value {
+        let val = var_info[v as usize].value;
+        match val {
             LBool::Undef => LBool::Undef,
             LBool::True => {
-                if sign(lit) { LBool::True } else { LBool::False }
+                if lit > 0 { LBool::True } else { LBool::False }
             }
             LBool::False => {
-                if sign(lit) { LBool::False } else { LBool::True }
+                if lit > 0 { LBool::False } else { LBool::True }
             }
         }
     }
@@ -200,14 +333,17 @@ impl SatSolver {
     /// Returns None if no conflict, or Some(clause_id) of the conflicting clause
     fn propagate(&mut self) -> Option<ClauseId> {
         while let Some(p) = self.propagation_queue.pop() {
-            // p just became true. Clauses watching -p (stored at watches[p])
+            // p just became true. Clauses watching -p (stored at watches[lit_index(p)])
             // need to find new watched literals since -p is now false.
-            let false_lit = Self::neg(p); // the literal that became false
-            let watch_list = self.watches.remove(&p).unwrap_or_default();
-            let mut new_watch_list = Vec::new();
+            let false_lit = -p;
+            let watch_idx = lit_index(p);
+
+            // Take watch list to avoid borrow conflicts
+            let mut watch_list = std::mem::take(&mut self.watches[watch_idx]);
+            let mut i = 0;
+            let mut j = 0; // compact in-place
             let mut conflict = None;
 
-            let mut i = 0;
             while i < watch_list.len() {
                 let cid = watch_list[i];
 
@@ -218,9 +354,10 @@ impl SatSolver {
 
                 let first_lit = self.clauses[cid].lits[0];
 
-                // If first literal is true, clause is satisfied
+                // If first literal is true, clause is satisfied - keep watching
                 if Self::value_lit_raw(&self.var_info, first_lit) == LBool::True {
-                    new_watch_list.push(cid);
+                    watch_list[j] = cid;
+                    j += 1;
                     i += 1;
                     continue;
                 }
@@ -228,13 +365,12 @@ impl SatSolver {
                 // Look for new literal to watch
                 let mut found = false;
                 let clause_len = self.clauses[cid].lits.len();
-                for j in 2..clause_len {
-                    let lit_j = self.clauses[cid].lits[j];
-                    if Self::value_lit_raw(&self.var_info, lit_j) != LBool::False {
-                        self.clauses[cid].lits.swap(1, j);
-                        // Watch on neg of the new literal at position 1
-                        let new_watch_lit = Self::neg(self.clauses[cid].lits[1]);
-                        self.watches.entry(new_watch_lit).or_default().push(cid);
+                for k in 2..clause_len {
+                    let lit_k = self.clauses[cid].lits[k];
+                    if Self::value_lit_raw(&self.var_info, lit_k) != LBool::False {
+                        self.clauses[cid].lits.swap(1, k);
+                        let new_watch_idx = lit_index(-self.clauses[cid].lits[1]);
+                        self.watches[new_watch_idx].push(cid);
                         found = true;
                         break;
                     }
@@ -245,22 +381,27 @@ impl SatSolver {
                     continue;
                 }
 
-                // No replacement found - unit or conflict
-                new_watch_list.push(cid);
-                let unit_lit = self.clauses[cid].lits[0];
+                // No replacement found - unit or conflict: keep watching
+                watch_list[j] = cid;
+                j += 1;
+                let unit_lit = first_lit;
                 if Self::value_lit_raw(&self.var_info, unit_lit) == LBool::False {
-                    // Conflict!
+                    // Conflict! Copy remaining watches
                     conflict = Some(cid);
-                    for &remaining in &watch_list[i + 1..] {
-                        new_watch_list.push(remaining);
+                    while i + 1 < watch_list.len() {
+                        i += 1;
+                        watch_list[j] = watch_list[i];
+                        j += 1;
                     }
                     break;
                 } else {
                     // Unit propagation
                     if !self.enqueue(unit_lit, Some(cid)) {
                         conflict = Some(cid);
-                        for &remaining in &watch_list[i + 1..] {
-                            new_watch_list.push(remaining);
+                        while i + 1 < watch_list.len() {
+                            i += 1;
+                            watch_list[j] = watch_list[i];
+                            j += 1;
                         }
                         break;
                     }
@@ -268,9 +409,8 @@ impl SatSolver {
                 i += 1;
             }
 
-            if !new_watch_list.is_empty() {
-                self.watches.insert(p, new_watch_list);
-            }
+            watch_list.truncate(j);
+            self.watches[watch_idx] = watch_list;
 
             if conflict.is_some() {
                 self.propagation_queue.clear();
@@ -282,8 +422,9 @@ impl SatSolver {
 
     /// Analyze conflict using First-UIP scheme
     /// Returns (learnt clause, backtrack level)
-    fn analyze(&self, conflict_cid: ClauseId) -> (Vec<Lit>, u32) {
-        let mut seen = vec![false; self.num_vars as usize + 1];
+    fn analyze(&mut self, conflict_cid: ClauseId) -> (Vec<Lit>, u32) {
+        // Track all variables we mark as seen, for efficient cleanup
+        let mut seen_vars: Vec<Var> = Vec::new();
         let mut learnt = Vec::new();
         let mut counter = 0;
         let mut p: Option<Lit> = None;
@@ -296,15 +437,13 @@ impl SatSolver {
         loop {
             let clause = &self.clauses[reason_cid];
             for &lit in &clause.lits {
-                if Some(lit) == p.map(Self::neg) || Some(lit) == p {
-                    // skip the resolved literal (check both signs for safety)
-                    if Some(var_of(lit)) == p.map(var_of) {
-                        continue;
-                    }
+                if Some(var_of(lit)) == p.map(var_of) {
+                    continue;
                 }
                 let v = var_of(lit);
-                if !seen[v as usize] {
-                    seen[v as usize] = true;
+                if !self.seen[v as usize] {
+                    self.seen[v as usize] = true;
+                    seen_vars.push(v);
                     let lv = self.var_info[v as usize].level;
                     if lv == self.decision_level() {
                         counter += 1;
@@ -321,7 +460,7 @@ impl SatSolver {
             loop {
                 trail_idx -= 1;
                 let trail_lit = self.trail[trail_idx];
-                if seen[var_of(trail_lit) as usize] {
+                if self.seen[var_of(trail_lit) as usize] {
                     p = Some(trail_lit);
                     break;
                 }
@@ -340,40 +479,36 @@ impl SatSolver {
         // First literal of learnt clause is the asserting literal (negation of UIP)
         learnt.insert(0, Self::neg(p.unwrap()));
 
-        // bt_level is the second highest decision level in the learnt clause
-        // If there's only one literal (unit learnt clause), backtrack to level 0
+        // Clean up seen vector
+        for v in seen_vars {
+            self.seen[v as usize] = false;
+        }
+
         (learnt, bt_level)
     }
 
     fn backtrack(&mut self, level: u32) {
-        while self.trail.len()
-            > if level == 0 {
-                0
-            } else {
-                self.trail_lim[level as usize - 1]
+        if self.decision_level() <= level {
+            return;
+        }
+        let target_size = if level == 0 {
+            // Preserve level 0 assignments (unit propagations)
+            if self.trail_lim.is_empty() {
+                return;
             }
-        {
-            if self.trail.is_empty() {
-                break;
-            }
-            // Check if we'd go below the target
-            let target_size = if level == 0 {
-                0
-            } else {
-                if (level as usize - 1) < self.trail_lim.len() {
-                    self.trail_lim[level as usize - 1]
-                } else {
-                    break;
-                }
-            };
-            if self.trail.len() <= target_size {
-                break;
-            }
+            self.trail_lim[0]
+        } else if (level as usize - 1) < self.trail_lim.len() {
+            self.trail_lim[level as usize - 1]
+        } else {
+            return;
+        };
 
+        while self.trail.len() > target_size {
             let lit = self.trail.pop().unwrap();
             let v = var_of(lit);
             self.var_info[v as usize].value = LBool::Undef;
             self.var_info[v as usize].reason = None;
+            self.var_heap.insert(v, &self.activity);
         }
         self.trail_lim.truncate(level as usize);
         self.propagation_queue.clear();
@@ -388,25 +523,27 @@ impl SatSolver {
             }
             self.var_inc *= 1e-100;
         }
+        // Update heap position after activity change
+        self.var_heap.update(v, &self.activity);
     }
 
     fn decay_activity(&mut self) {
         self.var_inc /= 0.95;
     }
 
-    /// Pick the unassigned variable with highest activity (VSIDS)
-    fn pick_decision_var(&self) -> Option<Var> {
-        let mut best: Option<Var> = None;
-        let mut best_act = -1.0f64;
-        for v in 1..=self.num_vars {
-            if self.var_info[v as usize].value == LBool::Undef {
-                if self.activity[v as usize] > best_act {
-                    best_act = self.activity[v as usize];
-                    best = Some(v);
+    /// Pick the unassigned variable with highest activity (VSIDS) using binary heap
+    fn pick_decision_var(&mut self) -> Option<Var> {
+        loop {
+            match self.var_heap.pop_max(&self.activity) {
+                None => return None,
+                Some(v) => {
+                    if self.var_info[v as usize].value == LBool::Undef {
+                        return Some(v);
+                    }
+                    // Variable already assigned, skip it
                 }
             }
         }
-        best
     }
 
     fn add_learnt_clause(&mut self, lits: Vec<Lit>) {
@@ -416,14 +553,10 @@ impl SatSolver {
         }
 
         let cid = self.clauses.len();
-        self.watches
-            .entry(Self::neg(lits[0]))
-            .or_default()
-            .push(cid);
-        self.watches
-            .entry(Self::neg(lits[1]))
-            .or_default()
-            .push(cid);
+        let idx0 = lit_index(-lits[0]);
+        let idx1 = lit_index(-lits[1]);
+        self.watches[idx0].push(cid);
+        self.watches[idx1].push(cid);
 
         self.clauses.push(Clause {
             lits: lits.clone(),
@@ -465,7 +598,7 @@ impl SatSolver {
                 None => {
                     // No conflict - make a decision
                     match self.pick_decision_var() {
-                        None => return SatResult::Sat, // all variables assigned
+                        None => return SatResult::Sat,
                         Some(v) => {
                             self.trail_lim.push(self.trail.len());
                             // Decide positive polarity

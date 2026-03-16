@@ -7,6 +7,9 @@ description = "An SMT solver supporting Boolean and bitvector theories with SMT-
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
 [features]
 default = []
 python = ["pyo3"]
@@ -18,3 +21,7 @@ crate-type = ["cdylib", "rlib"]
 [[bin]]
 name = "claude-smt"
 path = "src/main.rs"
+
+[[bench]]
+name = "solver_benchmarks"
+harness = false

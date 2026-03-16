@@ -105,6 +105,17 @@ impl TheorySolver {
     /// Check if current constraints are satisfiable.
     /// Uses a search over free theory variables.
     pub fn check_sat(&mut self) -> SatStatus {
+        // Try to solve simple equality constraints directly first
+        if self.try_direct_solve() {
+            if self.check_all_constraints() {
+                return SatStatus::Sat;
+            }
+            // Direct solve assigned values but constraints failed, clear and try search
+            for (_, var) in self.variables.iter_mut() {
+                var.value = None;
+            }
+        }
+
         // Collect free (unassigned) theory variables
         let free_vars: Vec<(String, Sort)> = self
             .variables
@@ -130,9 +141,59 @@ impl TheorySolver {
         }
     }
 
+    /// Try to solve simple equality constraints directly without search.
+    /// Returns true if it assigned all variables, false otherwise.
+    fn try_direct_solve(&mut self) -> bool {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for ci in 0..self.constraints.len() {
+                if !self.constraints[ci].expected {
+                    continue;
+                }
+                let term = self.constraints[ci].term.clone();
+                if let Term::Eq(ref a, ref b) = term {
+                    // x = <expr> or <expr> = x
+                    if let Some((var_name, expr)) = self.extract_var_eq(a, b) {
+                        if self.variables.get(&var_name).and_then(|v| v.value.as_ref()).is_some() {
+                            continue; // already assigned
+                        }
+                        // Try to evaluate the expression
+                        if let Some(val) = self.eval_value(expr) {
+                            self.variables.get_mut(&var_name).unwrap().value = Some(val);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        // Check if all variables got assigned
+        self.variables.values().all(|v| v.value.is_some())
+    }
+
+    /// Extract (variable_name, expression) from an equality if one side is a variable
+    fn extract_var_eq<'b>(&self, a: &'b Term, b: &'b Term) -> Option<(String, &'b Term)> {
+        if let Term::Variable(name) = a {
+            if self.variables.contains_key(name) {
+                return Some((name.clone(), b));
+            }
+        }
+        if let Term::Variable(name) = b {
+            if self.variables.contains_key(name) {
+                return Some((name.clone(), a));
+            }
+        }
+        None
+    }
+
     fn search_assignment(&mut self, free_vars: &[(String, Sort)], idx: usize) -> bool {
         if idx >= free_vars.len() {
             return self.check_all_constraints();
+        }
+
+        // Early pruning: check constraints that are fully evaluable with current assignment
+        if !self.check_partial_constraints() {
+            return false;
         }
 
         let (name, sort) = &free_vars[idx];
@@ -146,6 +207,19 @@ impl TheorySolver {
         }
         self.variables.get_mut(name).unwrap().value = None;
         false
+    }
+
+    /// Check constraints that can be fully evaluated with current partial assignment.
+    /// Returns false if any fully-evaluable constraint is violated (prune early).
+    fn check_partial_constraints(&self) -> bool {
+        for c in &self.constraints {
+            if let Some(v) = self.eval_bool(&c.term) {
+                if v != c.expected {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Generate candidate values for a variable based on constraints
