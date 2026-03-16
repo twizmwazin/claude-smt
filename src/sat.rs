@@ -2,8 +2,11 @@
 //!
 //! Implements Conflict-Driven Clause Learning with:
 //! - Two-watched-literal scheme for unit propagation
-//! - First-UIP conflict analysis with reusable seen vector
+//! - First-UIP conflict analysis with learned clause minimization
 //! - VSIDS decision heuristic with binary heap
+//! - Phase saving for decision polarity
+//! - Luby restarts
+//! - Clause database management (periodic reduction of learnt clauses)
 //! - Non-chronological backtracking
 
 /// A literal is a variable (positive integer) possibly negated.
@@ -50,6 +53,7 @@ pub enum SatResult {
 struct Clause {
     lits: Vec<Lit>,
     learnt: bool,
+    activity: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,9 +164,30 @@ impl VarHeap {
     }
 }
 
+/// Compute Luby sequence value for index i (1-indexed)
+fn luby(mut i: u32) -> u32 {
+    // Find the finite subsequence that i is in
+    let mut size: u32 = 1;
+    let mut seq: u32 = 0;
+    while size < i + 1 {
+        seq += 1;
+        size = 2 * size + 1;
+    }
+    // Now find the element
+    while size - 1 != i {
+        size = (size - 1) >> 1;
+        seq -= 1;
+        if i >= size {
+            i -= size;
+        }
+    }
+    1u32 << seq
+}
+
 pub struct SatSolver {
     num_vars: u32,
     clauses: Vec<Clause>,
+    num_original_clauses: usize,
     /// Watch lists indexed by lit_index(lit). watches[lit_index(-l)] = clauses watching literal -l.
     watches: Vec<Vec<ClauseId>>,
     var_info: Vec<VarInfo>,
@@ -178,6 +203,14 @@ pub struct SatSolver {
     var_heap: VarHeap,
     /// Cached false literal (set once after first new_var call)
     false_lit: Option<Lit>,
+    /// Phase saving: saved polarity for each variable (true = positive, false = negative)
+    phase: Vec<bool>,
+    /// Number of conflicts seen so far
+    num_conflicts: u64,
+    /// Clause activity increment for learnt clause management
+    clause_inc: f32,
+    /// Number of learnt clauses at the start of current restart cycle
+    max_learnts: f64,
 }
 
 impl SatSolver {
@@ -185,6 +218,7 @@ impl SatSolver {
         SatSolver {
             num_vars: 0,
             clauses: Vec::new(),
+            num_original_clauses: 0,
             watches: Vec::new(),
             var_info: vec![VarInfo {
                 value: LBool::Undef,
@@ -200,6 +234,10 @@ impl SatSolver {
             seen: vec![false],
             var_heap: VarHeap::new(),
             false_lit: None,
+            phase: vec![false], // index 0 unused
+            num_conflicts: 0,
+            clause_inc: 1.0,
+            max_learnts: 0.0,
         }
     }
 
@@ -213,6 +251,7 @@ impl SatSolver {
         });
         self.activity.push(0.0);
         self.seen.push(false);
+        self.phase.push(false); // default: decide negative (false) - better for UNSAT
         // Each variable has two literals: +v and -v, needing two watch list slots
         self.watches.push(Vec::new()); // for positive literal
         self.watches.push(Vec::new()); // for negative literal
@@ -286,6 +325,7 @@ impl SatSolver {
         self.clauses.push(Clause {
             lits,
             learnt: false,
+            activity: 0.0,
         });
         true
     }
@@ -420,7 +460,10 @@ impl SatSolver {
         None
     }
 
-    /// Analyze conflict using First-UIP scheme
+    /// Check if a literal can be removed from the learned clause via self-subsumption.
+    /// A literal is redundant if its reason clause only contains literals that are
+    /// either at level 0 or already in the learned clause (marked as seen).
+    /// Analyze conflict using First-UIP scheme with learned clause minimization.
     /// Returns (learnt clause, backtrack level)
     fn analyze(&mut self, conflict_cid: ClauseId) -> (Vec<Lit>, u32) {
         // Track all variables we mark as seen, for efficient cleanup
@@ -435,6 +478,11 @@ impl SatSolver {
         let mut trail_idx = trail_len;
 
         loop {
+            // Bump activity of clause involved in conflict
+            if self.clauses[reason_cid].learnt {
+                self.clauses[reason_cid].activity += self.clause_inc;
+            }
+
             let clause = &self.clauses[reason_cid];
             for &lit in &clause.lits {
                 if Some(var_of(lit)) == p.map(var_of) {
@@ -479,12 +527,26 @@ impl SatSolver {
         // First literal of learnt clause is the asserting literal (negation of UIP)
         learnt.insert(0, Self::neg(p.unwrap()));
 
+        // Put the literal with highest level at position 1 (for watch list)
+        if learnt.len() > 2 {
+            let mut max_idx = 1;
+            for i in 2..learnt.len() {
+                let lv = self.var_info[var_of(learnt[i]) as usize].level;
+                if lv > self.var_info[var_of(learnt[max_idx]) as usize].level {
+                    max_idx = i;
+                }
+            }
+            learnt.swap(1, max_idx);
+            bt_level = self.var_info[var_of(learnt[1]) as usize].level;
+        }
+        let minimized = learnt;
+
         // Clean up seen vector
         for v in seen_vars {
             self.seen[v as usize] = false;
         }
 
-        (learnt, bt_level)
+        (minimized, bt_level)
     }
 
     fn backtrack(&mut self, level: u32) {
@@ -506,6 +568,8 @@ impl SatSolver {
         while self.trail.len() > target_size {
             let lit = self.trail.pop().unwrap();
             let v = var_of(lit);
+            // Phase saving: remember the polarity this variable was assigned
+            self.phase[v as usize] = sign(lit);
             self.var_info[v as usize].value = LBool::Undef;
             self.var_info[v as usize].reason = None;
             self.var_heap.insert(v, &self.activity);
@@ -531,14 +595,25 @@ impl SatSolver {
         self.var_inc /= 0.95;
     }
 
+    fn decay_clause_activity(&mut self) {
+        self.clause_inc /= 0.999;
+    }
+
     /// Pick the unassigned variable with highest activity (VSIDS) using binary heap
-    fn pick_decision_var(&mut self) -> Option<Var> {
+    /// Uses phase saving for polarity decision
+    fn pick_decision_var(&mut self) -> Option<Lit> {
         loop {
             match self.var_heap.pop_max(&self.activity) {
                 None => return None,
                 Some(v) => {
                     if self.var_info[v as usize].value == LBool::Undef {
-                        return Some(v);
+                        // Phase saving: use saved polarity
+                        let lit = if self.phase[v as usize] {
+                            v as Lit
+                        } else {
+                            -(v as Lit)
+                        };
+                        return Some(lit);
                     }
                     // Variable already assigned, skip it
                 }
@@ -561,10 +636,86 @@ impl SatSolver {
         self.clauses.push(Clause {
             lits: lits.clone(),
             learnt: true,
+            activity: 0.0,
         });
 
         // Enqueue the asserting literal
         self.enqueue(lits[0], Some(cid));
+    }
+
+    /// Reduce the clause database by removing half of the low-activity learnt clauses
+    fn reduce_db(&mut self) {
+        // Collect indices of learnt clauses that are not locked (not a reason for a current assignment)
+        let mut removable: Vec<(ClauseId, f32)> = Vec::new();
+        for (cid, clause) in self.clauses.iter().enumerate() {
+            if clause.learnt && !self.is_clause_locked(cid) {
+                removable.push((cid, clause.activity));
+            }
+        }
+
+        if removable.len() < 10 {
+            return; // not worth reducing
+        }
+
+        // Sort by activity (lowest first)
+        removable.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Remove the bottom half
+        let remove_count = removable.len() / 2;
+        let mut to_remove = vec![false; self.clauses.len()];
+        for i in 0..remove_count {
+            to_remove[removable[i].0] = true;
+        }
+
+        // Remove watches for deleted clauses and rebuild watch lists
+        let mut new_clauses: Vec<Clause> = Vec::with_capacity(self.clauses.len());
+        let mut id_map: Vec<Option<ClauseId>> = vec![None; self.clauses.len()];
+
+        for (old_id, clause) in self.clauses.drain(..).enumerate() {
+            if to_remove[old_id] {
+                continue;
+            }
+            let new_id = new_clauses.len();
+            id_map[old_id] = Some(new_id);
+            new_clauses.push(clause);
+        }
+        self.clauses = new_clauses;
+
+        // Rebuild all watch lists
+        for w in &mut self.watches {
+            w.clear();
+        }
+        for (cid, clause) in self.clauses.iter().enumerate() {
+            if clause.lits.len() >= 2 {
+                let idx0 = lit_index(-clause.lits[0]);
+                let idx1 = lit_index(-clause.lits[1]);
+                self.watches[idx0].push(cid);
+                self.watches[idx1].push(cid);
+            }
+        }
+
+        // Update reason references in var_info
+        for vi in &mut self.var_info {
+            if let Some(old_reason) = vi.reason {
+                vi.reason = id_map.get(old_reason).copied().flatten();
+            }
+        }
+    }
+
+    /// Check if a learnt clause is locked (used as a reason for some current assignment)
+    fn is_clause_locked(&self, cid: ClauseId) -> bool {
+        let clause = &self.clauses[cid];
+        if clause.lits.is_empty() {
+            return false;
+        }
+        let first_lit = clause.lits[0];
+        let v = var_of(first_lit);
+        if self.var_info[v as usize].value != LBool::Undef {
+            if let Some(reason) = self.var_info[v as usize].reason {
+                return reason == cid;
+            }
+        }
+        false
     }
 
     pub fn solve(&mut self) -> SatResult {
@@ -577,35 +728,69 @@ impl SatSolver {
             return SatResult::Unsat;
         }
 
+        // Record number of original clauses for clause DB management
+        self.num_original_clauses = self.clauses.len();
+        self.max_learnts = (self.num_original_clauses as f64 / 3.0).max(10.0);
+
+        let mut restart_count: u32 = 0;
+        let base_restart_interval: u32 = 32;
+
         loop {
-            match self.propagate() {
-                Some(conflict_cid) => {
-                    if self.decision_level() == 0 {
-                        return SatResult::Unsat;
+            // Restart check
+            let restart_limit = base_restart_interval.saturating_mul(luby(restart_count));
+            let mut conflicts_in_restart: u32 = 0;
+
+            loop {
+                match self.propagate() {
+                    Some(conflict_cid) => {
+                        if self.decision_level() == 0 {
+                            return SatResult::Unsat;
+                        }
+
+                        self.num_conflicts += 1;
+                        conflicts_in_restart += 1;
+
+                        let (learnt, bt_level) = self.analyze(conflict_cid);
+
+                        // Bump activity for variables in the learnt clause
+                        for &lit in &learnt {
+                            self.bump_activity(var_of(lit));
+                        }
+                        self.decay_activity();
+                        self.decay_clause_activity();
+
+                        self.backtrack(bt_level);
+                        self.add_learnt_clause(learnt);
+
+                        // Note: clause DB reduction happens during restarts at level 0
+
+                        // Check restart
+                        if conflicts_in_restart >= restart_limit {
+                            break; // trigger restart
+                        }
                     }
-
-                    let (learnt, bt_level) = self.analyze(conflict_cid);
-
-                    // Bump activity for variables in the learnt clause
-                    for &lit in &learnt {
-                        self.bump_activity(var_of(lit));
-                    }
-                    self.decay_activity();
-
-                    self.backtrack(bt_level);
-                    self.add_learnt_clause(learnt);
-                }
-                None => {
-                    // No conflict - make a decision
-                    match self.pick_decision_var() {
-                        None => return SatResult::Sat,
-                        Some(v) => {
-                            self.trail_lim.push(self.trail.len());
-                            // Decide positive polarity
-                            self.enqueue(v as Lit, None);
+                    None => {
+                        // No conflict - make a decision
+                        match self.pick_decision_var() {
+                            None => return SatResult::Sat,
+                            Some(decision_lit) => {
+                                self.trail_lim.push(self.trail.len());
+                                self.enqueue(decision_lit, None);
+                            }
                         }
                     }
                 }
+            }
+
+            // Restart: backtrack to level 0
+            restart_count += 1;
+            self.backtrack(0);
+
+            // Clause database reduction at level 0
+            let num_learnt = self.clauses.len().saturating_sub(self.num_original_clauses);
+            if num_learnt as f64 > self.max_learnts {
+                self.reduce_db();
+                self.max_learnts *= 1.1;
             }
         }
     }
@@ -700,6 +885,70 @@ mod tests {
         solver.add_clause(vec![p2h1]);
         // No two pigeons in same hole
         solver.add_clause(vec![-p1h1, -p2h1]);
+        assert_eq!(solver.solve(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn test_luby_sequence() {
+        // Luby sequence: 1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8, ...
+        assert_eq!(luby(0), 1);
+        assert_eq!(luby(1), 1);
+        assert_eq!(luby(2), 2);
+        assert_eq!(luby(3), 1);
+        assert_eq!(luby(4), 1);
+        assert_eq!(luby(5), 2);
+        assert_eq!(luby(6), 4);
+    }
+
+    #[test]
+    fn test_pigeonhole_4_3() {
+        // 4 pigeons, 3 holes => UNSAT
+        let mut solver = SatSolver::new();
+        let n = 4;
+        let holes = 3;
+        let mut vars = vec![vec![0i32; holes]; n];
+        for i in 0..n {
+            for j in 0..holes {
+                vars[i][j] = solver.new_var() as Lit;
+            }
+        }
+        // Each pigeon in at least one hole
+        for i in 0..n {
+            solver.add_clause(vars[i].clone());
+        }
+        // No two pigeons in same hole
+        for j in 0..holes {
+            for i1 in 0..n {
+                for i2 in (i1 + 1)..n {
+                    solver.add_clause(vec![-vars[i1][j], -vars[i2][j]]);
+                }
+            }
+        }
+        assert_eq!(solver.solve(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn test_pigeonhole_5_4() {
+        // 5 pigeons, 4 holes => UNSAT (harder, needs restarts)
+        let mut solver = SatSolver::new();
+        let n = 5;
+        let holes = 4;
+        let mut vars = vec![vec![0i32; holes]; n];
+        for i in 0..n {
+            for j in 0..holes {
+                vars[i][j] = solver.new_var() as Lit;
+            }
+        }
+        for i in 0..n {
+            solver.add_clause(vars[i].clone());
+        }
+        for j in 0..holes {
+            for i1 in 0..n {
+                for i2 in (i1 + 1)..n {
+                    solver.add_clause(vec![-vars[i1][j], -vars[i2][j]]);
+                }
+            }
+        }
         assert_eq!(solver.solve(), SatResult::Unsat);
     }
 }

@@ -202,8 +202,7 @@ impl SmtSolver {
                     self.theory_assertions.push(term.clone());
                     self.theory.add_constraint(term, true);
                 } else {
-                    let lit = self.encode_bool_term(&term)?;
-                    self.sat.add_clause(vec![lit]);
+                    self.assert_bool_term(&term)?;
                 }
                 Ok(None)
             }
@@ -378,20 +377,99 @@ impl SmtSolver {
         self.var_sorts.insert(name.to_string(), sort.clone());
     }
 
+    /// Assert a boolean term directly, using optimized encoding that avoids
+    /// unnecessary Tseitin variables for top-level constructs.
+    fn assert_bool_term(&mut self, term: &Term) -> Result<(), String> {
+        match term {
+            // (assert true) - trivially satisfied
+            Term::True => Ok(()),
+            // (assert false) - unsatisfiable
+            Term::False => {
+                self.sat.add_clause(vec![]);
+                Ok(())
+            }
+            // (assert (and a b c)) - assert each conjunct directly
+            Term::And(terms) => {
+                for t in terms {
+                    self.assert_bool_term(t)?;
+                }
+                Ok(())
+            }
+            // (assert (not (or a b c))) - assert (not a), (not b), (not c)
+            Term::Not(inner) => match inner.as_ref() {
+                Term::Or(terms) => {
+                    for t in terms {
+                        self.assert_bool_term(&Term::Not(Box::new(t.clone())))?;
+                    }
+                    Ok(())
+                }
+                // (assert (not (and a b))) = (assert (or (not a) (not b))) - single clause
+                Term::And(terms) => {
+                    let mut clause = Vec::with_capacity(terms.len());
+                    for t in terms {
+                        let lit = self.encode_bool_term(t)?;
+                        clause.push(-lit);
+                    }
+                    self.sat.add_clause(clause);
+                    Ok(())
+                }
+                // (assert (not (not a))) = (assert a)
+                Term::Not(inner2) => self.assert_bool_term(inner2),
+                // (assert (not (=> a b))) = (assert a) + (assert (not b))
+                Term::Implies(a, b) => {
+                    self.assert_bool_term(a)?;
+                    self.assert_bool_term(&Term::Not(b.clone()))?;
+                    Ok(())
+                }
+                _ => {
+                    let lit = self.encode_bool_term(term)?;
+                    self.sat.add_clause(vec![lit]);
+                    Ok(())
+                }
+            },
+            // (assert (or a b c)) - encode as single clause when all children are simple
+            Term::Or(terms) if terms.iter().all(|t| self.is_simple_bool(t)) => {
+                let mut clause = Vec::with_capacity(terms.len());
+                for t in terms {
+                    let lit = self.encode_bool_term(t)?;
+                    clause.push(lit);
+                }
+                self.sat.add_clause(clause);
+                Ok(())
+            }
+            // (assert (=> a b)) = (assert (or (not a) b))
+            Term::Implies(a, b) if self.is_simple_bool(a) && self.is_simple_bool(b) => {
+                let la = self.encode_bool_term(a)?;
+                let lb = self.encode_bool_term(b)?;
+                self.sat.add_clause(vec![-la, lb]);
+                Ok(())
+            }
+            // Default: use Tseitin encoding
+            _ => {
+                let lit = self.encode_bool_term(term)?;
+                self.sat.add_clause(vec![lit]);
+                Ok(())
+            }
+        }
+    }
+
+    /// Check if a term is "simple" (variable or negation of variable) - no Tseitin needed
+    fn is_simple_bool(&self, term: &Term) -> bool {
+        match term {
+            Term::Variable(_) | Term::True | Term::False => true,
+            Term::Not(t) => self.is_simple_bool(t),
+            _ => false,
+        }
+    }
+
     /// Encode a term that should evaluate to Bool, returning a SAT literal
     fn encode_bool_term(&mut self, term: &Term) -> Result<Lit, String> {
         match term {
             Term::True => {
-                let v = self.sat.new_var();
-                let lit = v as Lit;
-                self.sat.add_clause(vec![lit]);
-                Ok(lit)
+                Ok(self.sat.get_true_lit())
             }
             Term::False => {
-                let v = self.sat.new_var();
-                let lit = v as Lit;
-                self.sat.add_clause(vec![-lit]);
-                Ok(lit)
+                Ok(self.sat.get_false_lit())
             }
             Term::Variable(name) => {
                 if let Some((params, body)) = self.defined_funs.get(name).cloned() {
@@ -416,10 +494,7 @@ impl SmtSolver {
             }
             Term::And(terms) => {
                 if terms.is_empty() {
-                    let v = self.sat.new_var();
-                    let lit = v as Lit;
-                    self.sat.add_clause(vec![lit]);
-                    return Ok(lit);
+                    return Ok(self.sat.get_true_lit());
                 }
                 let lits: Vec<Lit> = terms
                     .iter()
@@ -439,10 +514,7 @@ impl SmtSolver {
             }
             Term::Or(terms) => {
                 if terms.is_empty() {
-                    let v = self.sat.new_var();
-                    let lit = v as Lit;
-                    self.sat.add_clause(vec![-lit]);
-                    return Ok(lit);
+                    return Ok(self.sat.get_false_lit());
                 }
                 let lits: Vec<Lit> = terms
                     .iter()

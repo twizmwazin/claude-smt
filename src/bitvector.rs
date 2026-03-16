@@ -551,11 +551,9 @@ impl<'a> BitBlaster<'a> {
     pub fn sign_extend(&mut self, n: u32, bv: &BitVec) -> BitVec {
         let sign_bit = *bv.bits.last().unwrap();
         let mut bits = bv.bits.clone();
+        // Reuse the sign bit literal directly - no need for new variables
         for _ in 0..n {
-            let ext = self.solver.new_var() as Lit;
-            self.solver.add_clause(vec![-ext, sign_bit]);
-            self.solver.add_clause(vec![ext, -sign_bit]);
-            bits.push(ext);
+            bits.push(sign_bit);
         }
         BitVec { bits }
     }

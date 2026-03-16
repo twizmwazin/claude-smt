@@ -1,0 +1,13 @@
+; Multiple 16-bit bitvector constraints - system of equations
+(set-logic QF_BV)
+(declare-const a (_ BitVec 16))
+(declare-const b (_ BitVec 16))
+(declare-const c (_ BitVec 16))
+(assert (= (bvadd a b) #x00FF))
+(assert (= (bvadd b c) #x01FE))
+(assert (= (bvsub c a) #x00FF))
+(assert (bvugt a #x0000))
+(assert (bvugt b #x0000))
+(assert (bvugt c #x0000))
+(check-sat)
+(exit)
